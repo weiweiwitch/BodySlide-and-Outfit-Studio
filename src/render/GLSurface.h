@@ -11,6 +11,17 @@ See the included LICENSE file
 #include <wx/glcanvas.h>
 
 class GLSurface {
+public:
+	enum CursorType {
+		CenterCursor = 1,
+		PointCursor = 2,
+		CircleCursor = 4,
+		SegCursor = 8,
+		BrushCursor = CenterCursor | PointCursor | CircleCursor,
+		VertexCursor = CenterCursor | PointCursor,
+		EdgeCursor = CenterCursor | SegCursor
+	};
+private:
 	wxGLCanvas* canvas = nullptr;
 	wxGLContext* context = nullptr;
 
@@ -32,11 +43,11 @@ class GLSurface {
 	bool bMaskVisible = true;
 	bool bWeightColors = false;
 	bool bVertexColors = false;
-	bool bSegmentColors = false;
 
 	float defLineWidth = 1.0f;
 	float defPointSize = 5.0f;
 	float cursorSize = 0.5f;
+	CursorType cursorType;
 
 	GLShader::DirectionalLight frontalLight;
 	GLShader::DirectionalLight directionalLight0;
@@ -45,6 +56,7 @@ class GLSurface {
 	float ambientLight = 0.2f;
 
 	Vector3 colorBackground = Vector3(0.82f, 0.82f, 0.82f);
+	Vector3 colorWire = Vector3(0.3137f, 0.3137f, 0.3137f);
 	Vector3 colorRed = Vector3(1.0f, 0.25f, 0.25f);
 	Vector3 colorGreen = Vector3(0.25f, 1.0f, 0.25f);
 
@@ -66,6 +78,8 @@ class GLSurface {
 
 	void DeleteMesh(int meshID) {
 		if (meshID < meshes.size()) {
+			SetContext();
+
 			activeMeshes.erase(std::remove(activeMeshes.begin(), activeMeshes.end(), meshes[meshID]), activeMeshes.end());
 			activeMeshesID.erase(std::remove(activeMeshesID.begin(), activeMeshesID.end(), meshID), activeMeshesID.end());
 
@@ -80,6 +94,8 @@ class GLSurface {
 
 	void DeleteOverlay(int meshID) {
 		if (meshID < overlays.size()) {
+			SetContext();
+
 			delete overlays[meshID];
 			overlays.erase(overlays.begin() + meshID);
 
@@ -102,7 +118,17 @@ public:
 		colorBackground = color;
 	}
 
+	Vector3 GetWireColor() {
+		return colorWire;
+	}
+
+	void SetWireColor(const Vector3& color) {
+		colorWire = color;
+	}
+
 	void DeleteAllMeshes() {
+		SetContext();
+
 		for (auto &m : meshes)
 			delete m;
 
@@ -121,6 +147,8 @@ public:
 	}
 
 	void DeleteOverlays() {
+		SetContext();
+
 		for (int i = 0; i < overlays.size(); i++)
 			delete overlays[i];
 
@@ -247,6 +275,9 @@ public:
 		cursorSize = newsize;
 	}
 
+	CursorType GetCursorType() const {return cursorType;}
+	void SetCursorType(CursorType newType) {cursorType = newType;}
+
 	int Initialize(wxGLCanvas* canvas, wxGLContext* context);
 	void Cleanup();
 
@@ -272,9 +303,11 @@ public:
 
 	void GetPickRay(int ScreenX, int ScreenY, mesh* m, Vector3& dirVect, Vector3& outNearPos);
 	int PickMesh(int ScreenX, int ScreenY);
-	bool UpdateCursor(int ScreenX, int ScreenY, bool allMeshes = true, std::string* hitMeshName = nullptr, int* outHoverPoint = nullptr, Vector3* outHoverColor = nullptr, float* outHoverAlpha = nullptr);
+	bool UpdateCursor(int ScreenX, int ScreenY, bool allMeshes = true, std::string* hitMeshName = nullptr, int* outHoverPoint = nullptr, Vector3* outHoverColor = nullptr, float* outHoverAlpha = nullptr, Edge* outHoverEdge = nullptr);
 	bool GetCursorVertex(int ScreenX, int ScreenY, int* outIndex = nullptr);
 	void ShowCursor(bool show = true);
+	void HidePointCursor();
+	void HideSegCursor();
 
 	// Ray/mesh collision detection. From a screen point, calculates a ray and finds the nearest collision point and surface normal on
 	// the active mesh. Optionally, the ray and ray origin can be provided, which skips the internal call to GetPickRay.
@@ -283,14 +316,16 @@ public:
 	bool CollidePlane(int ScreenX, int ScreenY, Vector3& outOrigin, const Vector3& inPlaneNormal, float inPlaneDist);
 	bool CollideOverlay(int ScreenX, int ScreenY, Vector3& outOrigin, Vector3& outNormal, mesh** hitMesh = nullptr, int* outFacet = nullptr);
 
-	int AddVisCircle(const Vector3& center, const Vector3& normal, float radius, const std::string& name = "RingMesh");
+	mesh* AddVisCircle(const Vector3& center, const Vector3& normal, float radius, const std::string& name = "RingMesh");
 	mesh* AddVis3dRing(const Vector3& center, const Vector3& normal, float holeRadius, float ringRadius, const Vector3& color, const std::string& name);
 	mesh* AddVis3dArrow(const Vector3& origin, const Vector3& direction, float stemRadius, float pointRadius, float length, const Vector3& color, const std::string& name);
 	mesh* AddVis3dCube(const Vector3& center, const Vector3& normal, float radius, const Vector3& color, const std::string& name);
 	mesh* AddVisPoint(const Vector3& p, const std::string& name = "PointMesh", const Vector3* color = nullptr);
 	mesh* AddVisPlane(const Vector3& center, const Vector2& size, float uvScale = 1.0f, float uvOffset = 0.0f, const std::string& name = "PlaneMesh", const Vector3* color = nullptr);
+	mesh* AddVisSeg(const Vector3& p1, const Vector3& p2, const std::string& name);
 
 	mesh* AddMeshFromNif(NifFile* nif, const std::string& shapeName, Vector3* color = nullptr);
+	void SetSkinModelMat(mesh *m, const MatTransform &xformGlobalToSkin);
 	void Update(const std::string& shapeName, std::vector<Vector3>* vertices, std::vector<Vector2>* uvs = nullptr, std::set<int>* changed = nullptr);
 	void Update(int shapeIndex, std::vector<Vector3>* vertices, std::vector<Vector2>* uvs = nullptr, std::set<int>* changed = nullptr);
 	mesh* ReloadMeshFromNif(NifFile* nif, std::string shapeName);
@@ -312,6 +347,7 @@ public:
 		return &resLoader;
 	}
 
+	void SetContext();
 	void RenderOneFrame();
 	void RenderToTexture(GLMaterial* renderShader);
 	void RenderMesh(mesh* m);
@@ -374,16 +410,6 @@ public:
 	void SetVertexColors(bool bVisible = true) {
 		bVertexColors = bVisible;
 		bMaskVisible = !bVisible;
-
-		for (auto &m : meshes)
-			UpdateShaders(m);
-
-		for (auto &o : overlays)
-			UpdateShaders(o);
-	}
-
-	void SetSegmentColors(bool bVisible = true) {
-		bSegmentColors = bVisible;
 
 		for (auto &m : meshes)
 			UpdateShaders(m);

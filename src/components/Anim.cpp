@@ -4,6 +4,7 @@ See the included LICENSE file
 */
 
 #include "Anim.h"
+#include "../NIF/NifUtil.h"
 #include <wx/log.h>
 #include <wx/msgdlg.h>
 #include <unordered_set>
@@ -59,7 +60,6 @@ void AnimInfo::Clear() {
 		for (auto &s : refNif->GetShapeNames())
 			shapeBones[s].clear();
 
-		refNif->DeleteUnreferencedNodes();
 		refNif = nullptr;
 	}
 	else {
@@ -91,38 +91,38 @@ void AnimInfo::ClearShape(const std::string& shape) {
 	shapeSkinning.erase(shape);
 }
 
+bool AnimInfo::HasSkinnedShape(NiShape* shape) {
+	if (!shape)
+		return false;
+
+	if (shapeSkinning.find(shape->GetName()) != shapeSkinning.end())
+		return true;
+	else
+		return false;
+}
+
 void AnimInfo::DeleteVertsForShape(const std::string& shape, const std::vector<ushort>& indices) {
 	if (indices.empty())
 		return;
 
-	ushort highestRemoved = indices.back();
-	std::vector<int> indexCollapse(highestRemoved + 1, 0);
-
-	int remCount = 0;
-	for (int i = 0, j = 0; i < indexCollapse.size(); i++) {
-		if (j < indices.size() && indices[j] == i) {	// Found one to remove
-			indexCollapse[i] = -1;						// Flag delete
-			remCount++;
-			j++;
-		}
-		else
-			indexCollapse[i] = remCount;
-	}
+	int highestRemoved = indices.back();
+	std::vector<int> indexCollapse = GenerateIndexCollapseMap(indices, highestRemoved + 1);
 
 	auto& skin = shapeSkinning[shape];
 	for (auto &w : skin.boneWeights) {
-		std::unordered_map<ushort, float> indexCopy;
-		for (auto &d : w.second.weights) {
-			if (d.first > highestRemoved)
-				indexCopy.emplace(d.first - remCount, d.second);
-			else if (indexCollapse[d.first] != -1)
-				indexCopy.emplace(d.first - indexCollapse[d.first], d.second);
-		}
+		ApplyIndexMapToMapKeys(w.second.weights, indexCollapse, - static_cast<int>(indices.size()));
+	}
+}
 
-		w.second.weights.clear();
-		w.second.weights.reserve(indexCopy.size());
-		for (auto &copy : indexCopy)
-			w.second.weights[copy.first] = std::move(copy.second);
+void AnimSkin::InsertVertexIndices(const std::vector<ushort>& indices) {
+	if (indices.empty())
+		return;
+
+	int highestAdded = indices.back();
+	std::vector<int> indexExpand = GenerateIndexExpandMap(indices, highestAdded + 1);
+
+	for (auto &w : boneWeights) {
+		ApplyIndexMapToMapKeys(w.second.weights, indexExpand, indices.size());
 	}
 }
 
@@ -267,6 +267,11 @@ void AnimInfo::RecursiveRecalcXFormSkinToBone(const std::string& shape, AnimBone
 	RecalcXFormSkinToBone(shape, bPtr->boneName);
 	for (AnimBone *cptr : bPtr->children)
 		RecursiveRecalcXFormSkinToBone(shape, cptr);
+}
+
+void AnimInfo::ChangeGlobalToSkinTransform(const std::string& shape, const MatTransform &newTrans) {
+	shapeSkinning[shape].xformGlobalToSkin = newTrans;
+	RecursiveRecalcXFormSkinToBone(shape, AnimSkeleton::getInstance().GetRootBonePtr());
 }
 
 bool AnimInfo::CalcShapeSkinBounds(const std::string& shapeName, const int& boneIndex) {
@@ -471,8 +476,6 @@ void AnimInfo::WriteToNif(NifFile* nif, const std::string& shapeException) {
 				nif->SetShapeVertWeights(shapeBoneList.first, vid.first, vid.second.boneIds, vid.second.weights);
 		}
 	}
-
-	nif->DeleteUnreferencedNodes();
 
 	if (incomplete)
 		wxMessageBox(_("Bone information incomplete. Exported data will not contain correct bone entries! Be sure to load a reference NIF prior to export."), _("Export Warning"), wxICON_WARNING);

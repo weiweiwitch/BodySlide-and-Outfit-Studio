@@ -77,22 +77,28 @@ struct ShapeItemState {
 
 class SegmentItemData : public wxTreeItemData  {
 public:
-	std::set<uint> tris;
+	// partID: a small nonnegative integer uniquely identifying this
+	// segment among all the segments and subsegments.  Used as a value
+	// in triSParts.  Not in the file.
+	int partID;
 
-	SegmentItemData(const std::set<uint>& inTriangles) {
-		tris = inTriangles;
+	SegmentItemData(int inPartitionID) {
+		partID = inPartitionID;
 	}
 };
 
 class SubSegmentItemData : public wxTreeItemData  {
 public:
-	std::set<uint> tris;
+	// partID: a small nonnegative integer uniquely identifying this
+	// subsegment among all the segments and subsegments.  Used as a value
+	// in triSParts.  Not in the file.
+	int partID;
 	uint userSlotID;
 	uint material;
 	std::vector<float> extraData;
 
-	SubSegmentItemData(const std::set<uint>& inTriangles, const uint& inUserSlotID, const uint& inMaterial, const std::vector<float>& inExtraData = std::vector<float>()) {
-		tris = inTriangles;
+	SubSegmentItemData(int inPartitionID, const uint& inUserSlotID, const uint& inMaterial, const std::vector<float>& inExtraData = std::vector<float>()) {
+		partID = inPartitionID;
 		userSlotID = inUserSlotID;
 		material = inMaterial;
 		extraData = inExtraData;
@@ -113,11 +119,33 @@ public:
 struct WeightCopyOptions {
 	float proximityRadius = 0.0f;
 	int maxResults = 0;
+	bool showSkinTransOption = false;
+	bool doSkinTransCopy = false;
+	bool doTransformGeo = false;
 };
 
 struct ConformOptions {
 	float proximityRadius = 0.0f;
 	int maxResults = 0;
+};
+
+enum class ToolID {
+	Any = -1,
+	Select = 0,
+	MaskBrush,
+	InflateBrush,
+	DeflateBrush,
+	MoveBrush,
+	SmoothBrush,
+	WeightBrush,
+	ColorBrush,
+	AlphaBrush,
+	CollapseVertex,
+	FlipEdge,
+	SplitEdge,
+	Transform,
+	Pivot,
+	VertexEdit
 };
 
 
@@ -154,7 +182,10 @@ public:
 		return &undoHistory;
 	}
 
-	void SetActiveBrush(int brushID);
+	void SetActiveTool(ToolID brushID);
+	ToolID GetActiveTool() {
+		return activeTool;
+	}
 	TweakBrush* GetActiveBrush() {
 		return activeBrush;
 	}
@@ -177,6 +208,17 @@ public:
 
 	bool SelectVertex(const wxPoint& screenPos);
 
+	bool StartPickVertex();
+	void UpdatePickVertex(const wxPoint& screenPos);
+	void EndPickVertex();
+	void ClickCollapseVertex();
+
+	bool StartPickEdge();
+	void UpdatePickEdge(const wxPoint& screenPos);
+	void EndPickEdge();
+	void ClickFlipEdge();
+	void ClickSplitEdge();
+
 	bool RestoreMode(UndoStateProject *usp);
 	void ApplyUndoState(UndoStateProject *usp, bool bUndo);
 	bool UndoStroke();
@@ -197,12 +239,16 @@ public:
 		editMode = on;
 	}
 
+	bool GetBrushMode() {return brushMode;}
+	void SetBrushMode(bool on = true) {brushMode = on;}
+
 	bool GetVertexEdit() {
 		return vertexEdit;
 	}
 	void SetVertexEdit(bool on = true) {
 		vertexEdit = on;
 		ShowVertexEdit(on);
+		Render();
 	}
 
 	bool GetTransformMode() {
@@ -343,6 +389,10 @@ public:
 		return str;
 	}
 
+	void SetCursorType(GLSurface::CursorType cursorType) {
+		gls.SetCursorType(cursorType);
+	}
+
 	void ShowWireframe() {
 		gls.ToggleWireframe();
 	}
@@ -365,10 +415,6 @@ public:
 
 	void SetColorsVisible(bool bVisible = true) {
 		gls.SetVertexColors(bVisible);
-	}
-
-	void SetSegmentsVisible(bool bVisible = true) {
-		gls.SetSegmentColors(bVisible);
 	}
 
 	void ClearMasks() {
@@ -528,6 +574,38 @@ public:
 		}
 	}
 
+	Vector3 CreateColorRamp(const float value) {
+		float r;
+		float g;
+		float b;
+
+		if (value <= 0.0f) {
+			r = g = b = 1.0;
+		}
+		else if (value <= 0.25) {
+			r = 0.0;
+			b = 1.0;
+			g = value / 0.25;
+		}
+		else if (value <= 0.5) {
+			r = 0.0;
+			g = 1.0;
+			b = 1.0 + (-1.0) * (value - 0.25) / 0.25;
+		}
+		else if (value <= 0.75) {
+			r = (value - 0.5) / 0.25;
+			g = 1.0;
+			b = 0.0;
+		}
+		else {
+			r = 1.0;
+			g = 1.0 + (-1.0) * (value - 0.75) / 0.25;
+			b = 0.0;
+		}
+
+		return Vector3(r, g, b);
+	}
+
 	void DeleteMesh(const std::string& shape) {
 		gls.DeleteMesh(shape);
 	}
@@ -621,6 +699,9 @@ private:
 
 	int lastX;
 	int lastY;
+	std::string hoverMeshName, mouseDownMeshName;
+	int hoverPoint, mouseDownPoint;
+	Edge hoverEdge, mouseDownEdge;
 
 	std::set<int> BVHUpdateQueue;
 
@@ -629,18 +710,19 @@ private:
 	float brushSize;
 
 	bool editMode;
+	bool brushMode;
 	bool transformMode;
 	bool pivotMode;
 	bool vertexEdit;
 	bool segmentMode;
 
-	bool bMaskPaint;
-	bool bWeightPaint;
-	bool bColorPaint;
+	ToolID activeTool;
 	bool isPainting;
 	bool isTransforming;
 	bool isMovingPivot;
 	bool isSelecting;
+	bool isPickingVertex;
+	bool isPickingEdge;
 	bool bXMirror;
 	bool bConnectedEdit;
 	bool bGlobalBrushCollision;
@@ -746,6 +828,7 @@ public:
 	bool bEditSlider;
 	std::string contextBone;
 	std::vector<int> triParts;  // the partition index for each triangle, or -1 for none
+	std::vector<int> triSParts;  // the segment partition index for each triangle, or -1 for none
 
 	wxTreeCtrl* outfitShapes;
 	wxTreeCtrl* outfitBones;
@@ -833,10 +916,14 @@ public:
 	void ShowPartition(const wxTreeItemId& item = nullptr, bool updateFromMask = false);
 	void UpdatePartitionNames();
 
+	void SetSubMeshesForPartitions(mesh *m, const std::vector<int> &tp);
+	void SetNoSubMeshes(mesh *m);
+	void SetNoSubMeshes();
+
 	void LockShapeSelect();
 	void UnlockShapeSelect();
 	void AnimationGUIFromProj();
-	void RefreshGUIFromProj();
+	void RefreshGUIFromProj(bool render = true);
 	void MeshesFromProj(const bool reloadTextures = false);
 	void MeshFromProj(NiShape* shape, const bool reloadTextures = false);
 
@@ -851,22 +938,6 @@ public:
 	void ExitSliderEdit();
 	void MenuEnterSliderEdit();
 	void MenuExitSliderEdit();
-
-	enum ToolID {
-		Any = -1,
-		Select = 0,
-		MaskBrush = 1,
-		InflateBrush = 2,
-		DeflateBrush = 3,
-		MoveBrush = 4,
-		SmoothBrush = 5,
-		WeightBrush = 6,
-		ColorBrush = 7,
-		AlphaBrush = 8,
-		Transform,
-		Pivot,
-		VertexEdit
-	};
 
 	void SelectTool(ToolID tool);
 
@@ -1038,6 +1109,7 @@ private:
 	void FillVertexColors();
 
 	bool HasUnweightedCheck();
+	void CalcCopySkinTransOption(WeightCopyOptions &options);
 	bool ShowWeightCopy(WeightCopyOptions& options);
 	void ReselectBone();
 
@@ -1122,6 +1194,7 @@ private:
 	void OnBoneContext(wxTreeEvent& event);
 	void OnBoneTreeContext(wxCommandEvent& event);
 
+	int CalcMaxSegPartID();
 	void OnSegmentSelect(wxTreeEvent& event);
 	void OnSegmentContext(wxTreeEvent& event);
 	void OnSegmentTreeContext(wxCommandEvent& event);
@@ -1219,6 +1292,7 @@ private:
 	void OnTransferSelectedWeight(wxCommandEvent& event);
 	void OnMaskWeighted(wxCommandEvent& event);
 	void OnResetTransforms(wxCommandEvent& event);
+	void OnDeleteUnreferencedNodes(wxCommandEvent& event);
 	void OnRemoveSkinning(wxCommandEvent& event);
 	void OnShapeProperties(wxCommandEvent& event);
 

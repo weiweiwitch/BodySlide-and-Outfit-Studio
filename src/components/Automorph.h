@@ -10,6 +10,8 @@ See the included LICENSE file
 #include "Mesh.h"
 #include "SliderSet.h"
 
+class AnimInfo;
+
 class Automorph {
 	std::unique_ptr<kd_tree> refTree;
 	std::map<std::string, mesh*> sourceShapes;
@@ -45,7 +47,7 @@ public:
 		bEnableMask = enable;
 	}
 
-	void SetRef(NifFile& Ref, NiShape* refShape);
+	void SetRef(NifFile& Ref, NiShape* refShape, const AnimInfo *workAnim);
 
 	void LinkRefDiffData(DiffDataSets* diffData);
 	void UnlinkRefDiffData();
@@ -54,12 +56,15 @@ public:
 	bool ApplyResultToVerts(const std::string& sliderName, const std::string& shapeTargetName, std::vector<Vector3>* inOutResult, float strength = 1.0f);
 	bool ApplyResultToUVs(const std::string& sliderName, const std::string& shapeTargetName, std::vector<Vector2>* inOutResult, float strength = 1.0f);
 
-	void SourceShapesFromNif(NifFile& baseNif);
+	void SourceShapesFromNif(NifFile& baseNif, const AnimInfo *workAnim);
 	void UpdateMeshFromNif(NifFile &baseNif, const std::string& shapeName);
 	void CopyMeshMask(mesh*m, const std::string& shapeName);
 
-	void MeshFromNifShape(mesh* m, NifFile& ref, NiShape* shape);
+	void MeshFromNifShape(mesh* m, NifFile& ref, NiShape* shape, const AnimInfo *workAnim);
+	// indices must be in ascending order.
 	void DeleteVerts(const std::string& shapeName, const std::vector<ushort>& indices);
+	// indices must be in ascending order.
+	void InsertVertexIndices(const std::string& target, const std::vector<ushort>& indices);
 
 	void ClearProximityCache();
 	void BuildProximityCache(const std::string& shapeName, const float proximityRadius = 10.0f);
@@ -73,6 +78,7 @@ public:
 
 	void GetRawResultDiff(const std::string& shapeName, const std::string& sliderName, std::unordered_map<ushort, Vector3>& outDiff);
 	int GetResultDiffSize(const std::string& shapeName, const std::string& sliderName);
+	std::unordered_map<ushort, Vector3>* GetDiffSet(const std::string& targetDataName);
 
 	void SetResultDiff(const std::string& shapeName, const std::string& sliderName, std::unordered_map<ushort, Vector3>& diff);
 	void UpdateResultDiff(const std::string& shapeName, const std::string& sliderName, std::unordered_map<ushort, Vector3>& diff);

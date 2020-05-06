@@ -2264,6 +2264,12 @@ msgstr ""
 msgid "Background color of the renderer."
 msgstr ""
 
+msgid "Wireframe Color"
+msgstr ""
+
+msgid "Wireframe color of the renderer."
+msgstr ""
+
 msgid "Unload Project"
 msgstr ""
 
@@ -2587,4 +2593,28 @@ msgid "Remove Skinning"
 msgstr ""
 
 msgid "Removes skinning of all shapes and all unused nodes."
+msgstr ""
+
+msgid "Collapse Vertex"
+msgstr ""
+
+msgid "Deletes vertices with no more than three connections, without creating a hole."
+msgstr ""
+
+msgid "The vertex picked has more than three connections."
+msgstr ""
+
+msgid "Delete Unreferenced Nodes"
+msgstr ""
+
+msgid "Deletes all nodes from the project that aren't used in any other block."
+msgstr ""
+
+msgid "%d unreferenced nodes were deleted."
+msgstr ""
+
+msgid "The shape has reached the vertex count limit."
+msgstr ""
+
+msgid "The shape has reached the triangle count limit."
 msgstr ""

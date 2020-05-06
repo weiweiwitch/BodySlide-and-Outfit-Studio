@@ -21,6 +21,11 @@ typedef unsigned char byte;
 typedef unsigned short ushort;
 typedef unsigned int uint;
 
+inline bool FloatsAreNearlyEqual(float a, float b) {
+	float scale = std::max(std::max(std::fabs(a), std::fabs(b)), 1.0f);
+	return std::fabs(a - b) <= EPSILON * scale;
+}
+
 struct Vector2 {
 	float u;
 	float v;
@@ -267,6 +272,31 @@ struct Vector3 {
 			y = 0.0f;
 		if (fabs(z) < EPSILON)
 			z = 0.0f;
+	}
+
+	bool IsNearlyEqualTo(const Vector3& other) const {
+		return FloatsAreNearlyEqual(x, other.x) &&
+			FloatsAreNearlyEqual(y, other.y) &&
+			FloatsAreNearlyEqual(z, other.z);
+	}
+
+	float length2() const {
+		return x*x + y*y + z*z;
+	}
+
+	float length() const {
+		return sqrt(x*x + y*y + z*z);
+	}
+
+	float DistanceToSegment(const Vector3& p1, const Vector3& p2) const {
+		Vector3 segvec(p2 - p1);
+		Vector3 diffp1(*this - p1);
+		float dp = segvec.dot(diffp1);
+		if (dp <= 0)
+			return diffp1.length();
+		else if (dp >= segvec.length2())
+			return (*this - p2).length();
+		return segvec.cross(diffp1).length() / segvec.length();
 	}
 };
 
@@ -538,6 +568,12 @@ public:
 		p *= 180.0f / PI;
 		r *= 180.0f / PI;
 		return canRot;
+	}
+
+	bool IsNearlyEqualTo(const Matrix3 &other) const {
+		return rows[0].IsNearlyEqualTo(other.rows[0]) &&
+			rows[1].IsNearlyEqualTo(other.rows[1]) &&
+			rows[2].IsNearlyEqualTo(other.rows[2]);
 	}
 };
 
@@ -963,8 +999,30 @@ struct MatTransform {
 	// of this and other.  That is, if t3 = t1.ComposeTransforms(t2), then
 	// t3.ApplyTransform(v) == t1.ApplyTransform(t2.ApplyTransform(v)).
 	MatTransform ComposeTransforms(const MatTransform &other) const;
+
+	bool IsNearlyEqualTo(const MatTransform &other) const {
+		return translation.IsNearlyEqualTo(other.translation) &&
+			rotation.IsNearlyEqualTo(other.rotation) &&
+			FloatsAreNearlyEqual(scale, other.scale);
+	}
 };
 
+
+struct Edge {
+	ushort p1;
+	ushort p2;
+
+	Edge() {
+		p1 = p2 = 0;
+	}
+	Edge(ushort P1, ushort P2) {
+		p1 = P1; p2 = P2;
+	}
+
+	bool CompareIndices(const Edge& o) {
+		return (p1 == o.p1 && p2 == o.p2) || (p1 == o.p2 && p2 == o.p1);
+	}
+};
 
 struct Triangle {
 	ushort p1;
@@ -984,13 +1042,13 @@ struct Triangle {
 		p1 = P1; p2 = P2; p3 = P3;
 	}
 
-	void trinormal(Vector3* vertref, Vector3* outNormal) {
+	void trinormal(Vector3* vertref, Vector3* outNormal) const {
 		outNormal->x = (vertref[p2].y - vertref[p1].y) * (vertref[p3].z - vertref[p1].z) - (vertref[p2].z - vertref[p1].z) * (vertref[p3].y - vertref[p1].y);
 		outNormal->y = (vertref[p2].z - vertref[p1].z) * (vertref[p3].x - vertref[p1].x) - (vertref[p2].x - vertref[p1].x) * (vertref[p3].z - vertref[p1].z);
 		outNormal->z = (vertref[p2].x - vertref[p1].x) * (vertref[p3].y - vertref[p1].y) - (vertref[p2].y - vertref[p1].y) * (vertref[p3].x - vertref[p1].x);
 	}
 
-	void trinormal(const std::vector<Vector3>& vertref, Vector3* outNormal) {
+	void trinormal(const std::vector<Vector3>& vertref, Vector3* outNormal) const {
 		outNormal->x = (vertref[p2].y - vertref[p1].y) * (vertref[p3].z - vertref[p1].z) - (vertref[p2].z - vertref[p1].z) * (vertref[p3].y - vertref[p1].y);
 		outNormal->y = (vertref[p2].z - vertref[p1].z) * (vertref[p3].x - vertref[p1].x) - (vertref[p2].x - vertref[p1].x) * (vertref[p3].z - vertref[p1].z);
 		outNormal->z = (vertref[p2].x - vertref[p1].x) * (vertref[p3].y - vertref[p1].y) - (vertref[p2].y - vertref[p1].y) * (vertref[p3].x - vertref[p1].x);
@@ -1013,6 +1071,23 @@ struct Triangle {
 
 	float AxisMidPointZ(Vector3* vertref) {
 		return (vertref[p1].z + vertref[p2].z + vertref[p3].z) / 3.0f;
+	}
+
+	bool HasOrientedEdge(const Edge &e) const {
+		return (e.p1 == p1 && e.p2 == p2) ||
+			(e.p1 == p2 && e.p2 == p3) ||
+			(e.p1 == p3 && e.p2 == p1);
+	}
+
+	Edge ClosestEdge(Vector3* vertref, const Vector3 &p) const {
+		float d1 = p.DistanceToSegment(vertref[p1], vertref[p2]);
+		float d2 = p.DistanceToSegment(vertref[p2], vertref[p3]);
+		float d3 = p.DistanceToSegment(vertref[p3], vertref[p1]);
+		if (d1 <= d2 && d1 <= d3)
+			return Edge(p1, p2);
+		else if (d2 < d3)
+			return Edge(p2, p3);
+		return Edge(p3, p1);
 	}
 
 	bool IntersectRay(Vector3* vertref, Vector3& origin, Vector3& direction, float* outDistance = nullptr, Vector3* worldPos = nullptr) {
@@ -1183,18 +1258,6 @@ struct Triangle {
 		else if (p3 < p1) {
 			set(p3, p1, p2);
 		}
-	}
-};
-
-struct Edge {
-	ushort p1;
-	ushort p2;
-
-	Edge() {
-		p1 = p2 = 0;
-	}
-	Edge(ushort P1, ushort P2) {
-		p1 = P1; p2 = P2;
 	}
 };
 

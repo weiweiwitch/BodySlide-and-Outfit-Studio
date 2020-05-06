@@ -10,6 +10,7 @@ See the included LICENSE file
 #include "../program/FBXImportDialog.h"
 #include "../utils/PlatformUtil.h"
 #include "../components/WeightNorm.h"
+#include "../NIF/NifUtil.h"
 
 #include "../FSEngine/FSManager.h"
 #include "../FSEngine/FSEngine.h"
@@ -117,7 +118,7 @@ std::string OutfitProject::Save(const wxString& strFileName,
 		outSet.SetLockNormals(shapeName, activeSet.GetLockNormals(shapeName));
 		owner->UpdateProgress(prog += step, _("Adding outfit shapes..."));
 	}
-	
+
 	std::string osdFileName = baseFile.substr(0, baseFile.find_last_of('.')) + ".osd";
 
 	if (activeSet.size() > 0) {
@@ -178,7 +179,7 @@ std::string OutfitProject::Save(const wxString& strFileName,
 
 	std::string saveDataPath = Config["AppDir"] + PathSepStr + "ShapeData" + PathSepStr + mDataDir.ToUTF8().data();
 	SaveSliderData(saveDataPath + PathSepStr + osdFileName, copyRef);
-	
+
 	prog = 60;
 	owner->UpdateProgress(prog, _("Creating slider set file..."));
 
@@ -263,7 +264,7 @@ bool OutfitProject::SaveSliderData(const std::string& fileName, bool copyRef) {
 
 		DiffDataSets osdDiffs;
 		std::map<std::string, std::map<std::string, std::string>> osdNames;
-		
+
 		// Copy the changed reference slider data and add the outfit data to them.
 		for (int i = 0; i < activeSet.size(); i++) {
 			if (copyRef && baseShape) {
@@ -1432,7 +1433,7 @@ void OutfitProject::UpdateShapeFromMesh(NiShape* shape, const mesh* m) {
 void OutfitProject::UpdateMorphResult(NiShape* shape, const std::string& sliderName, std::unordered_map<ushort, Vector3>& vertUpdates) {
 	// Morph results are stored in two different places depending on whether it's an outfit or the base shape.
 	// The outfit morphs are stored in the automorpher, whereas the base shape diff info is stored in directly in basediffdata.
-	
+
 	std::string target = ShapeToTarget(shape->GetName());
 	std::string dataName = activeSet[sliderName].TargetDataName(target);
 	if (!vertUpdates.empty()) {
@@ -1476,6 +1477,37 @@ void OutfitProject::ScaleShape(NiShape* shape, const Vector3& scale, std::unorde
 
 void OutfitProject::RotateShape(NiShape* shape, const Vector3& angle, std::unordered_map<ushort, float>* mask) {
 	workNif.RotateShape(shape, angle, mask);
+}
+
+void OutfitProject::ApplyTransformToShapeGeometry(NiShape* shape, const MatTransform &t) {
+	if (!shape)
+		return;
+
+	// Vertices
+	const std::vector<Vector3>* oldVerts = workNif.GetRawVertsForShape(shape);
+	if (!oldVerts || oldVerts->empty())
+		return;
+
+	int nVerts = oldVerts->size();
+	std::vector<Vector3> verts(nVerts);
+	for (int i = 0; i < nVerts; ++i)
+		verts[i] = t.ApplyTransform((*oldVerts)[i]);
+
+	workNif.SetVertsForShape(shape, verts);
+
+	// Normals
+	if (t.rotation.IsNearlyEqualTo(Matrix3()))
+		return;
+
+	const std::vector<Vector3>* oldNorms = workNif.GetNormalsForShape(shape, false);
+	if (!oldNorms || oldNorms->size() != nVerts)
+		return;
+
+	std::vector<Vector3> norms(nVerts);
+	for (int i = 0; i < nVerts; ++i)
+		norms[i] = t.rotation * (*oldNorms)[i];
+
+	workNif.SetNormalsForShape(shape, norms);
 }
 
 void OutfitProject::CopyBoneWeights(NiShape* shape, const float proximityRadius, const int maxResults, std::unordered_map<ushort, float>& mask, const std::vector<std::string>& boneList, int nCopyBones, const std::vector<std::string> &lockedBones, UndoStateShape &uss, bool bSpreadWeight) {
@@ -2187,9 +2219,9 @@ int OutfitProject::AddFromSliderSet(const std::string& fileName, const std::stri
 
 void OutfitProject::InitConform() {
 	if (baseShape) {
-		morpher.SetRef(workNif, baseShape);
+		morpher.SetRef(workNif, baseShape, &workAnim);
 		morpher.LinkRefDiffData(&baseDiffData);
-		morpher.SourceShapesFromNif(workNif);
+		morpher.SourceShapesFromNif(workNif, &workAnim);
 	}
 }
 
@@ -2205,32 +2237,801 @@ void OutfitProject::ConformShape(NiShape* shape, const float proximityRadius, co
 			morpher.GenerateResultDiff(shape->GetName(), activeSet[i].name, activeSet[i].TargetDataName(refTarget), maxResults);
 }
 
-bool OutfitProject::DeleteVerts(NiShape* shape, const std::unordered_map<ushort, float>& mask) {
-	std::vector<ushort> indices;
-	indices.reserve(mask.size());
+void OutfitProject::CollectVertexData(NiShape* shape, UndoStateShape &uss, const std::vector<int> &indices) {
+	uss.delVerts.resize(indices.size());
 
-	for (auto &m : mask)
-		indices.push_back(m.first);
+	const std::vector<Vector3> *verts = workNif.GetRawVertsForShape(shape);
+	const std::vector<Vector2> *uvs = workNif.GetUvsForShape(shape);
+	const std::vector<Color4> *colors = workNif.GetColorsForShape(shape->GetName());
+	const std::vector<Vector3> *normals = workNif.GetNormalsForShape(shape, false);
+	const std::vector<Vector3> *tangents = workNif.GetTangentsForShape(shape, false);
+	const std::vector<Vector3> *bitangents = workNif.GetBitangentsForShape(shape, false);
+	std::vector<float> *eyeData = workNif.GetEyeDataForShape(shape);
+	AnimSkin &skin = workAnim.shapeSkinning[shape->GetName()];
+	std::string target = ShapeToTarget(shape->GetName());
 
-	std::sort(indices.begin(), indices.end());
-	indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+	for (int di = 0; di < indices.size(); ++di) {
+		UndoStateVertex &usv = uss.delVerts[di];
+		int vi = indices[di];
+		usv.index = vi;
 
-	bool deleteShape = workNif.DeleteVertsForShape(shape, indices);
-	if (!deleteShape) {
-		workAnim.DeleteVertsForShape(shape->GetName(), indices);
+		if (verts && verts->size() > vi)
+			usv.pos = (*verts)[vi];
+		if (uvs && uvs->size() > vi)
+			usv.uv = (*uvs)[vi];
+		if (colors && colors->size() > vi)
+			usv.color = (*colors)[vi];
+		if (normals && normals->size() > vi)
+			usv.normal = (*normals)[vi];
+		if (tangents && tangents->size() > vi)
+			usv.tangent = (*tangents)[vi];
+		if (bitangents && bitangents->size() > vi)
+			usv.bitangent = (*bitangents)[vi];
+		if (eyeData && eyeData->size() > vi)
+			usv.eyeData = (*eyeData)[vi];
 
-		std::string target = ShapeToTarget(shape->GetName());
-		if (IsBaseShape(shape))
-			baseDiffData.DeleteVerts(target, indices);
-		else
-			morpher.DeleteVerts(target, indices);
-		
-		activeSet.SetReferencedData(shape->GetName(), true);
+		for (auto bnp : skin.boneNames) {
+			AnimWeight &aw = skin.boneWeights[bnp.second];
+			auto wit = aw.weights.find(vi);
+			if (wit != aw.weights.end())
+				usv.weights.emplace_back(UndoStateVertexBoneWeight{ bnp.first, wit->second });
+		}
 	}
-	else
-		DeleteShape(shape);
 
-	return deleteShape;
+	// For diffs, it's more efficient to reverse the loop nesting.
+	for (int si = 0; si < activeSet.size(); ++si) {
+		std::string targetDataName = activeSet[si].TargetDataName(target);
+		if (targetDataName.empty())
+			targetDataName = target + activeSet[si].name;
+		std::unordered_map<ushort, Vector3>* diffSet;
+		if (IsBaseShape(shape))
+			diffSet = baseDiffData.GetDiffSet(targetDataName);
+		else
+			diffSet = morpher.GetDiffSet(targetDataName);
+
+		if (!diffSet)
+			continue;
+
+		for (UndoStateVertex &usv : uss.delVerts) {
+			auto dit = diffSet->find(usv.index);
+			if (dit == diffSet->end())
+				continue;
+
+			usv.diffs.push_back(UndoStateVertexSliderDiff{ activeSet[si].name, dit->second });
+		}
+	}
+}
+
+void OutfitProject::CollectTriangleData(NiShape* shape, UndoStateShape &uss, const std::vector<int> &indices) {
+	uss.delTris.resize(indices.size());
+	std::vector<Triangle> tris;
+	shape->GetTriangles(tris);
+	std::vector<int> triParts;
+	NifSegmentationInfo inf;
+	if (!workNif.GetShapeSegments(shape, inf, triParts)) {
+		std::vector<BSDismemberSkinInstance::PartitionInfo> partitionInfo;
+		workNif.GetShapePartitions(shape, partitionInfo, triParts);
+	}
+
+	for (int di = 0; di < indices.size(); ++di) {
+		UndoStateTriangle &ust = uss.delTris[di];
+		int ti = indices[di];
+		ust.index = ti;
+		ust.t = tris[ti];
+		if (ti < triParts.size())
+			ust.partID = triParts[ti];
+		else
+			ust.partID = -1;
+	}
+}
+
+bool OutfitProject::PrepareDeleteVerts(NiShape* shape, const std::unordered_map<ushort, float>& mask, UndoStateShape &uss) {
+	int numVerts = shape->GetNumVertices();
+
+	// Set flag for every vertex index in mask
+	std::vector<bool> delVertFlags(numVerts, false);
+	for (auto &m : mask)
+		delVertFlags[m.first] = true;
+
+	// Generate list of triangles to delete.  Also count how many
+	// non-deleted triangles each vertex belongs to.
+	std::vector<Triangle> tris;
+	shape->GetTriangles(tris);
+
+	std::vector<int> delTriInds;
+	std::vector<int> vertTriCounts(numVerts, 0);
+
+	for (int ti = 0; ti < tris.size(); ++ti) {
+		if (delVertFlags[tris[ti].p1] ||
+			delVertFlags[tris[ti].p2] ||
+			delVertFlags[tris[ti].p3])
+			delTriInds.push_back(ti);
+		else {
+			++vertTriCounts[tris[ti].p1];
+			++vertTriCounts[tris[ti].p2];
+			++vertTriCounts[tris[ti].p3];
+		}
+	}
+
+	// If all triangles are deleted, then delete the whole shape.
+	if (delTriInds.size() >= tris.size())
+		return true;
+
+	// Generate new list of vertices to delete: vertices that are not
+	// used by any non-deleted triangle.
+	std::vector<int> delVertInds;
+	for (int vi = 0; vi < numVerts; ++vi)
+		if (vertTriCounts[vi] <= 0)
+			delVertInds.push_back(vi);
+
+	// If all vertices are deleted, then delete the whole shape.
+	if (delVertInds.size() >= numVerts)
+		return true;
+
+	// Now collect the vertex and triangle data.
+	CollectVertexData(shape, uss, delVertInds);
+	CollectTriangleData(shape, uss, delTriInds);
+
+	return false;
+}
+
+void OutfitProject::ApplyShapeMeshUndo(NiShape* shape, const UndoStateShape &uss, bool bUndo) {
+	const std::vector<UndoStateVertex> &delVerts = bUndo ? uss.addVerts : uss.delVerts;
+	const std::vector<UndoStateVertex> &addVerts = bUndo ? uss.delVerts : uss.addVerts;
+	const std::vector<UndoStateTriangle> &delTris = bUndo ? uss.addTris : uss.delTris;
+	const std::vector<UndoStateTriangle> &addTris = bUndo ? uss.delTris : uss.addTris;
+
+	// Gather data
+	std::vector<Triangle> tris;
+	shape->GetTriangles(tris);
+
+	std::vector<int> triParts;
+	NifSegmentationInfo inf;
+	bool gotsegs = workNif.GetShapeSegments(shape, inf, triParts);
+	std::vector<BSDismemberSkinInstance::PartitionInfo> partitionInfo;
+	bool gotparts = false;
+	if (!gotsegs)
+		gotparts = workNif.GetShapePartitions(shape, partitionInfo, triParts);
+
+	std::vector<Vector3> verts;
+	workNif.GetVertsForShape(shape, verts);
+
+	const std::vector<Vector2> *uvsp = workNif.GetUvsForShape(shape);
+	const std::vector<Color4> *colorsp = workNif.GetColorsForShape(shape->GetName());
+	const std::vector<Vector3> *normalsp = workNif.GetNormalsForShape(shape, false);
+	const std::vector<Vector3> *tangentsp = workNif.GetTangentsForShape(shape, false);
+	const std::vector<Vector3> *bitangentsp = workNif.GetBitangentsForShape(shape, false);
+	std::vector<float> *eyeDatap = workNif.GetEyeDataForShape(shape);
+
+	std::vector<Vector2> uvs;
+	std::vector<Color4> colors;
+	std::vector<Vector3> normals;
+	std::vector<Vector3> tangents;
+	std::vector<Vector3> bitangents;
+	std::vector<float> eyeData;
+	if (uvsp)
+		uvs = *uvsp;
+	if (colorsp)
+		colors = *colorsp;
+	if (normalsp)
+		normals = *normalsp;
+	if (tangentsp)
+		tangents = *tangentsp;
+	if (bitangentsp)
+		bitangents = *bitangentsp;
+	if (eyeDatap)
+		eyeData = *eyeDatap;
+
+	AnimSkin &skin = workAnim.shapeSkinning[shape->GetName()];
+	std::string target = ShapeToTarget(shape->GetName());
+
+	if (!delTris.empty()) {
+		// Delete triangles
+		std::vector<int> delTriInds(delTris.size());
+		for (int di = 0; di < delTris.size(); ++di)
+			delTriInds[di] = delTris[di].index;
+
+		EraseVectorIndices(tris, delTriInds);
+
+		if (gotsegs || gotparts)
+			EraseVectorIndices(triParts, delTriInds);
+	}
+
+	if (!delVerts.empty()) {
+		// Delete vertices...
+		std::vector<ushort> delVertInds(delVerts.size());
+		for (int di = 0; di < delVerts.size(); ++di)
+			delVertInds[di] = delVerts[di].index;
+		std::vector<int> vertCollapseMap = GenerateIndexCollapseMap(delVertInds, verts.size());
+
+		// ...from triangles
+		ApplyMapToTriangles(tris, vertCollapseMap);
+
+		// ...from workAnim
+		workAnim.DeleteVertsForShape(shape->GetName(), delVertInds);
+
+		// ...from diff data
+		if (IsBaseShape(shape))
+			baseDiffData.DeleteVerts(target, delVertInds);
+		else
+			morpher.DeleteVerts(target, delVertInds);
+
+		// ...from nif arrays
+		EraseVectorIndices(verts, delVertInds);
+		if (uvsp)
+			EraseVectorIndices(uvs, delVertInds);
+		if (colorsp)
+			EraseVectorIndices(colors, delVertInds);
+		if (normalsp)
+			EraseVectorIndices(normals, delVertInds);
+		if (tangentsp)
+			EraseVectorIndices(tangents, delVertInds);
+		if (bitangentsp)
+			EraseVectorIndices(bitangents, delVertInds);
+		if (eyeDatap)
+			EraseVectorIndices(eyeData, delVertInds);
+	}
+
+	if (!addVerts.empty()) {
+		// Insert new vertex indices...
+		std::vector<ushort> insVertInds(addVerts.size());
+		for (int di = 0; di < addVerts.size(); ++di)
+			insVertInds[di] = addVerts[di].index;
+		std::vector<int> vertExpandMap = GenerateIndexExpandMap(insVertInds, verts.size());
+
+		// ...into triangles
+		ApplyMapToTriangles(tris, vertExpandMap);
+
+		// ...into workAnim
+		skin.InsertVertexIndices(insVertInds);
+
+		// ...into diff data
+		if (IsBaseShape(shape))
+			baseDiffData.InsertVertexIndices(target, insVertInds);
+		else
+			morpher.InsertVertexIndices(target, insVertInds);
+
+		// ...into nif arrays
+		InsertVectorIndices(verts, insVertInds);
+		if (uvsp)
+			InsertVectorIndices(uvs, insVertInds);
+		if (colorsp)
+			InsertVectorIndices(colors, insVertInds);
+		if (normalsp)
+			InsertVectorIndices(normals, insVertInds);
+		if (tangentsp)
+			InsertVectorIndices(tangents, insVertInds);
+		if (bitangentsp)
+			InsertVectorIndices(bitangents, insVertInds);
+		if (eyeDatap)
+			InsertVectorIndices(eyeData, insVertInds);
+
+		// Store vertex data...
+		for (const UndoStateVertex &usv : addVerts) {
+			// ...in nif arrays
+			verts[usv.index] = usv.pos;
+			if (uvsp && uvs.size() > usv.index)
+				uvs[usv.index] = usv.uv;
+			if (colorsp && colors.size() > usv.index)
+				colors[usv.index] = usv.color;
+			if (normalsp && normals.size() > usv.index)
+				normals[usv.index] = usv.normal;
+			if (tangentsp && tangents.size() > usv.index)
+				tangents[usv.index] = usv.tangent;
+			if (bitangentsp && bitangents.size() > usv.index)
+				bitangents[usv.index] = usv.bitangent;
+			if (eyeDatap && eyeData.size() > usv.index)
+				eyeData[usv.index] = usv.eyeData;
+
+			// ...in workAnim
+			for (const auto &usvbw : usv.weights) {
+				auto bnit = skin.boneNames.find(usvbw.boneName);
+				if (bnit == skin.boneNames.end()) {
+					workAnim.AddShapeBone(shape->GetName(), usvbw.boneName);
+					bnit = skin.boneNames.find(usvbw.boneName);
+				}
+				skin.boneWeights[bnit->second].weights[usv.index] = usvbw.w;
+			}
+
+			// ...in diff data
+			for (const UndoStateVertexSliderDiff &diff : usv.diffs) {
+				std::string targetDataName = activeSet[diff.sliderName].TargetDataName(target);
+				if (targetDataName.empty())
+					targetDataName = target + diff.sliderName;
+				std::unordered_map<ushort, Vector3>* diffSet;
+				if (IsBaseShape(shape))
+					diffSet = baseDiffData.GetDiffSet(targetDataName);
+				else
+					diffSet = morpher.GetDiffSet(targetDataName);
+				if (!diffSet)	// should be impossible
+					continue;
+				(*diffSet)[usv.index] = diff.diff;
+			}
+		}
+	}
+
+	if (!addTris.empty()) {
+		// Insert new triangle indices
+		std::vector<int> insTriInds(addTris.size());
+		for (int di = 0; di < addTris.size(); ++di)
+			insTriInds[di] = addTris[di].index;
+
+		InsertVectorIndices(tris, insTriInds);
+
+		if (gotsegs || gotparts)
+			InsertVectorIndices(triParts, insTriInds);
+
+		// Store triangle data
+		for (const UndoStateTriangle &ust : addTris) {
+			tris[ust.index] = ust.t;
+			if (gotsegs || gotparts)
+				triParts[ust.index] = ust.partID;
+		}
+	}
+
+	// Put data back in nif
+	workNif.SetVertsForShape(shape, verts);
+	if (uvsp)
+		workNif.SetUvsForShape(shape, uvs);
+	if (colorsp)
+		workNif.SetColorsForShape(shape->GetName(), colors);
+	if (normalsp)
+		workNif.SetNormalsForShape(shape, normals);
+	if (tangentsp)
+		workNif.SetTangentsForShape(shape, tangents);
+	if (bitangentsp)
+		workNif.SetBitangentsForShape(shape, bitangents);
+	if (eyeDatap)
+		workNif.SetEyeDataForShape(shape, eyeData);
+
+	shape->SetTriangles(tris);
+
+	if (gotsegs)
+		workNif.SetShapeSegments(shape, inf, triParts);
+	if (gotparts)
+		workNif.SetShapePartitions(shape, partitionInfo, triParts);
+
+	// Note that we do not restore the nif's vertex bone weights.
+	// That should happen when the file is saved.
+}
+
+bool OutfitProject::PrepareCollapseVertex(NiShape* shape, UndoStateShape &uss, const std::vector<int> &indices) {
+	// Get triangle data
+	int numVerts = shape->GetNumVertices();
+
+	std::vector<Triangle> tris;
+	shape->GetTriangles(tris);
+
+	std::vector<int> triParts;
+	NifSegmentationInfo inf;
+
+	if (!workNif.GetShapeSegments(shape, inf, triParts)) {
+		std::vector<BSDismemberSkinInstance::PartitionInfo> partitionInfo;
+		workNif.GetShapePartitions(shape, partitionInfo, triParts);
+	}
+
+	// Note that indices is already in sorted order.
+	std::vector<int> ntris, nverts;
+	auto addneighbor = [&nverts](int vi) {
+		for (int evi : nverts)
+			if (vi == evi)
+				return;
+
+		nverts.push_back(vi);
+	};
+
+	std::vector<int> nrtris; // non-replaced triangles
+
+	for (int vi : indices) {
+		ntris.clear();
+		nverts.clear();
+
+		// Collect lists of neighboring triangles and vertices.
+		for (int ti = 0; ti < tris.size(); ++ti) {
+			const Triangle &t = tris[ti];
+			if (t.p1 != vi && t.p2 != vi && t.p3 != vi)
+				continue;
+
+			if (ntris.size() >= 3)
+				return false;
+
+			ntris.push_back(ti);
+
+			// Order of vertex collection is important, or we'll end up
+			// with a backwards triangle.
+			if (t.p1 == vi) {
+				addneighbor(t.p2);
+				addneighbor(t.p3);
+			}
+			else if (t.p2 == vi) {
+				addneighbor(t.p3);
+				addneighbor(t.p1);
+			}
+			else {
+				addneighbor(t.p1);
+				addneighbor(t.p2);
+			}
+
+			if (nverts.size() > 3)
+				return false;
+		}
+
+		// Make sure no neighboring vertices are welded to this vertex.
+		for (int nvi = 0; nvi < nverts.size(); ++nvi)
+			for (int ii = 0; ii < indices.size(); ++ii)
+				if (indices[ii] == nverts[nvi])
+					return false;
+
+		// Put triangles to delete in uss.delTris.
+		for (int vti = 0; vti < ntris.size(); ++vti) {
+			int ti = ntris[vti];
+			uss.delTris.push_back(UndoStateTriangle{ ti, tris[ti], ti < triParts.size() ? triParts[ti] : -1 });
+		}
+
+		int pti = -1;
+		if (nverts.size() == 3) {
+			// Determine preferred triangle to replace.
+			pti = 0;
+			if (!triParts.empty() && ntris.size() == 3 &&
+				triParts[ntris[0]] != triParts[ntris[1]] &&
+				triParts[ntris[1]] == triParts[ntris[2]])
+				pti = 1;
+
+			// Put new triangle in uss.
+			int ti = ntris[pti];
+			uss.addTris.push_back(UndoStateTriangle{ ti, Triangle(nverts[0], nverts[1], nverts[2]), ti < triParts.size() ? triParts[ti] : -1 });
+		}
+
+		// Collect list of non-replaced triangles for triangle renumbering.
+		for (int vti = 0; vti < ntris.size(); ++vti)
+			if (vti != pti)
+				nrtris.push_back(ntris[vti]);
+	}
+
+	// We've loaded all the triangle data; now load the vertex data.
+	CollectVertexData(shape, uss, indices);
+
+	// Renumber vertex and triangle indices in uss.addTris.
+	std::vector<int> vCollapse = GenerateIndexCollapseMap(indices, numVerts);
+
+	std::sort(nrtris.begin(), nrtris.end());
+	std::vector<int> tCollapse = GenerateIndexCollapseMap(nrtris, tris.size());
+
+	for (UndoStateTriangle &ust : uss.addTris) {
+		ust.t.p1 = vCollapse[ust.t.p1];
+		ust.t.p2 = vCollapse[ust.t.p2];
+		ust.t.p3 = vCollapse[ust.t.p3];
+		ust.index = tCollapse[ust.index];
+	}
+
+	// Sort uss.addTris and uss.delTris, since they weren't added in any
+	// particular order.
+	std::sort(uss.addTris.begin(), uss.addTris.end());
+	std::sort(uss.delTris.begin(), uss.delTris.end());
+
+	return true;
+}
+
+static int TriangleOppositeVertex(const Triangle &t, int p1) {
+	if (t.p1 == p1)
+		return t.p3;
+	else if (t.p2 == p1)
+		return t.p1;
+	else
+		return t.p2;
+}
+
+bool OutfitProject::PrepareFlipEdge(NiShape* shape, UndoStateShape &uss, const Edge &edge) {
+	// Get triangle data
+	std::vector<Triangle> tris;
+	shape->GetTriangles(tris);
+
+	std::vector<int> triParts;
+	NifSegmentationInfo inf;
+	if (!workNif.GetShapeSegments(shape, inf, triParts)) {
+		std::vector<BSDismemberSkinInstance::PartitionInfo> partitionInfo;
+		workNif.GetShapePartitions(shape, partitionInfo, triParts);
+	}
+
+	// Find the two neighboring triangles
+	int t1 = -1, t2 = -1;
+	const Edge redge(edge.p2, edge.p1);
+	for (int ti = 0; ti < tris.size(); ++ti) {
+		if (tris[ti].HasOrientedEdge(edge)) {
+			if (t1 != -1)
+				return false;
+			t1 = ti;
+		}
+
+		if (tris[ti].HasOrientedEdge(redge)) {
+			if (t2 != -1)
+				return false;
+			t2 = ti;
+		}
+	}
+	if (t1 == -1 || t2 == -1)
+		return false;
+
+	// Find the non-edge vertex for each neighboring triangle.
+	int nev1 = TriangleOppositeVertex(tris[t1], edge.p1);
+	int nev2 = TriangleOppositeVertex(tris[t2], edge.p2);
+
+	// Put data into uss.
+	int tp1 = t1 < triParts.size() ? triParts[t1] : -1;
+	int tp2 = t2 < triParts.size() ? triParts[t2] : -1;
+	uss.delTris.push_back(UndoStateTriangle{ t1, tris[t1], tp1 });
+	uss.delTris.push_back(UndoStateTriangle{ t2, tris[t2], tp2 });
+	uss.addTris.push_back(UndoStateTriangle{ t1, Triangle(edge.p1, nev2, nev1), tp1 });
+	uss.addTris.push_back(UndoStateTriangle{ t2, Triangle(edge.p2, nev1, nev2), tp2 });
+
+	// Sort delTris and addTris by index.
+	if (t2 < t1) {
+		std::swap(uss.delTris[0], uss.delTris[1]);
+		std::swap(uss.addTris[0], uss.addTris[1]);
+	}
+
+	return true;
+}
+
+bool OutfitProject::PrepareSplitEdge(NiShape* shape, UndoStateShape &uss, const std::vector<int> &p1s, const std::vector<int> &p2s) {
+	// Get vertex and triangle data
+	const std::vector<Vector3>* verts = workNif.GetRawVertsForShape(shape);
+	if (!verts)
+		return false;
+
+	int newvi = verts->size();
+
+	std::vector<Triangle> tris;
+	shape->GetTriangles(tris);
+
+	std::vector<int> triParts;
+	NifSegmentationInfo inf;
+	if (!workNif.GetShapeSegments(shape, inf, triParts)) {
+		std::vector<BSDismemberSkinInstance::PartitionInfo> partitionInfo;
+		workNif.GetShapePartitions(shape, partitionInfo, triParts);
+	}
+
+	// Find the two neighboring triangles.
+	int t1 = -1, t2 = -1;
+	Edge edge, redge;
+	for (int ti = 0; ti < tris.size(); ++ti) {
+		for (int p1 : p1s) {
+			for (int p2 : p2s) {
+				if (tris[ti].HasOrientedEdge(Edge(p1, p2))) {
+					if (t1 != -1)
+						return false;
+					t1 = ti;
+					edge.p1 = p1;
+					edge.p2 = p2;
+				}
+				if (tris[ti].HasOrientedEdge(Edge(p2, p1))) {
+					if (t2 != -1)
+						return false;
+					t2 = ti;
+					redge.p1 = p2;
+					redge.p2 = p1;
+				}
+			}
+		}
+	}
+	if (t1 == -1)
+		return false;
+
+	// Find non-edge vertex for each neighboring triangle.
+	int nev1 = TriangleOppositeVertex(tris[t1], edge.p1);
+	int nev2 = -1;
+	if (t2 != -1)
+		nev2 = TriangleOppositeVertex(tris[t2], redge.p1);
+
+	// Determine whether we have a welded edge.
+	bool welded = t2 != -1 && (redge.p1 != edge.p2 || redge.p2 != edge.p1);
+	int newrvi = newvi;
+	if (welded)
+		++newrvi;
+
+	// Put triangle data into uss.
+	if (t1 != -1) {
+		int newt1 = t1;
+		if (t2 != -1 && t2 < t1)
+			++newt1;
+
+		int tp = t1 < triParts.size() ? triParts[t1] : -1;
+		uss.delTris.push_back(UndoStateTriangle{ t1, tris[t1], tp });
+		uss.addTris.push_back(UndoStateTriangle{ newt1, Triangle(edge.p1, newvi, nev1), tp });
+		uss.addTris.push_back(UndoStateTriangle{ newt1 + 1, Triangle(nev1, newvi, edge.p2), tp });
+	}
+	if (t2 != -1) {
+		int newt2 = t2;
+		if (t1 != -1 && t1 < t2)
+			++newt2;
+
+		int tp = t2 < triParts.size() ? triParts[t2] : -1;
+		uss.delTris.push_back(UndoStateTriangle{ t2, tris[t2], tp });
+		uss.addTris.push_back(UndoStateTriangle{ newt2, Triangle(redge.p1, newrvi, nev2), tp });
+		uss.addTris.push_back(UndoStateTriangle{ newt2 + 1, Triangle(nev2, newrvi, redge.p2), tp });
+	}
+
+	// Sort delTris and addTris by index.
+	std::sort(uss.delTris.begin(), uss.delTris.end());
+	std::sort(uss.addTris.begin(), uss.addTris.end());
+
+	// Get data for the two edge vertices (in a secondary data-collection
+	// UndoStateShape).
+	UndoStateShape duss;
+	std::vector<int> edgeInds{ edge.p1, edge.p2 };
+	if (welded) {
+		edgeInds.push_back(redge.p1);
+		edgeInds.push_back(redge.p2);
+	}
+	CollectVertexData(shape, duss, edgeInds);
+	const UndoStateVertex &p1d = duss.delVerts[0];
+	const UndoStateVertex &p2d = duss.delVerts[1];
+	const UndoStateVertex &rp1d = duss.delVerts[welded ? 2 : 1];
+	const UndoStateVertex &rp2d = duss.delVerts[welded ? 3 : 0];
+	const Vector3 &p1 = p1d.pos;
+	const Vector3 &p2 = p2d.pos;
+
+	// Create entry for new vertex
+	uss.addVerts.emplace_back();
+	UndoStateVertex &usv = uss.addVerts.back();
+	usv.index = newvi;
+
+	/* Now comes the hard part: determining a good location for the
+	new vertex.  Clearly it should lie somewhere on the plane bisecting
+	the segment between p1 and p2.  If we wanted to be lazy, we could
+	just pick the midpoint.  But that would require the user to adjust
+	the position every time.  Better would be if we could fit a circle
+	through p1, p2, and the new point so that all three have normals
+	perpendicular to the circle.  But there's no guarantee that that's
+	possible: the old normals could have different angles to the edge;
+	and they could even be non-coplanar.  So we need to average the
+	angles for the two normals somehow.  There are several stages
+	where this could be done; I choose to do it early. */
+
+	// Calculate normals at p1 and p2 by averaging their triangle normals.
+	Vector3 np1, np2;
+	for (const Triangle &t : tris) {
+		if (t.p1 == edge.p1 || t.p2 == edge.p1 || t.p3 == edge.p1 ||
+			t.p1 == redge.p2 || t.p2 == redge.p2 || t.p3 == redge.p2) {
+			Vector3 tn;
+			t.trinormal(*verts, &tn);
+			tn.Normalize();
+			np1 += tn;
+		}
+		if (t.p1 == edge.p2 || t.p2 == edge.p2 || t.p3 == edge.p2 ||
+			t.p1 == redge.p1 || t.p2 == redge.p1 || t.p3 == redge.p1) {
+			Vector3 tn;
+			t.trinormal(*verts, &tn);
+			tn.Normalize();
+			np2 += tn;
+		}
+	}
+
+	np1.Normalize();
+	np2.Normalize();
+
+	// Starting position of new point: midpoint between p1 and p2
+	usv.pos = (p1 + p2) * 0.5;
+
+	Vector3 u12 = p2 - p1;	// unit vector from p1 to p2 (along the edge)
+	float elen = u12.length();	// edge length
+	u12.Normalize();
+
+	// Working normal for new point: average of np1 and np2, made
+	// perpendicular to u12.  (If you want something fancy for usv.normal,
+	// calculate it later.  This calculation needs to be done this
+	// way for the circle fitter.)
+	usv.normal = np1 + np2;
+	usv.normal -= u12 * u12.dot(usv.normal);
+	usv.normal.Normalize();
+
+	// Now, the angle between npi and usv.normal, in the plane of
+	// npi and u12 (since usv.normal isn't necessarily in that plane)
+	// would be asin(u12.dot(npi)).  We want to average this for np1
+	// and np2 and carefully preserve the sign.
+	float angle = asin(u12.dot(np2 - np1) * 0.5);
+	// Now, "angle" is the desired circle angle between the new point and
+	// either p1 or p2.  It's positive for convex, negative for concave.
+	// To figure out how far off of the edge we need to go, we need to
+	// take the trigonometric tangent of the correct angle.  It turns out
+	// the correct angle is the angle we just calculated divided by 2.
+	float curveOffsetFactor = tan(angle * 0.5);
+	// Now apply the offset to the new point.  (curveOffsetFactor is positive
+	// for convex, negative for concave, and will be no larger than 1.)
+	usv.pos += usv.normal * (curveOffsetFactor * elen * 0.5);
+
+	// Calculate uv, color, tangent, bitangent, and eyeData by averaging.
+	// We need to make sure normal, tangent, and bitangent are perpendicular.
+	usv.uv = (p1d.uv + p2d.uv) * 0.5;
+	usv.color.r = (p1d.color.r + p2d.color.r) * 0.5;
+	usv.color.g = (p1d.color.g + p2d.color.g) * 0.5;
+	usv.color.b = (p1d.color.b + p2d.color.b) * 0.5;
+	usv.color.a = (p1d.color.a + p2d.color.a) * 0.5;
+	usv.eyeData = (p1d.eyeData + p2d.eyeData) * 0.5;
+	usv.tangent = (p1d.tangent + p2d.tangent) * 0.5;
+	usv.bitangent = (p1d.bitangent + p2d.bitangent) * 0.5;
+	usv.tangent -= usv.normal * usv.normal.dot(usv.tangent);
+	usv.tangent.Normalize();
+	usv.bitangent -= usv.normal * usv.normal.dot(usv.bitangent);
+	usv.bitangent -= usv.tangent * usv.tangent.dot(usv.bitangent);
+	usv.bitangent.Normalize();
+
+	// Calculate weights by averaging.  Note that the resulting weights
+	// will add up to 1 if each source's weights do.
+	for (int si = 0; si < 2; ++si) {
+		const std::vector<UndoStateVertexBoneWeight> &swts = si ? p2d.weights : p1d.weights;
+		for (const UndoStateVertexBoneWeight &sw : swts) {
+			bool found = false;
+			for (int dwi = 0; dwi < usv.weights.size() && !found; ++dwi) {
+				if (usv.weights[dwi].boneName == sw.boneName) {
+					found = true;
+					usv.weights[dwi].w += sw.w;
+				}
+			}
+
+			if (!found)
+				usv.weights.push_back(sw);
+		}
+	}
+
+	for (auto &dw : usv.weights)
+		dw.w *= 0.5;
+
+	UndoStateVertex rusv;
+	if (welded) {
+		// New welded vertex gets exactly the same data except uv and uv-diffs.
+		rusv = usv;
+		rusv.index = newrvi;
+		rusv.uv = (rp1d.uv + rp2d.uv) * 0.5;
+	}
+
+	// Unfortunately, we can't just calculate diffs by averaging.  p1
+	// and p2 may have moved farther apart, which would require greater
+	// curve offset.
+
+	// diffpairs: key is sliderName.
+	std::unordered_map<std::string, std::pair<Vector3, Vector3>> diffpairs;
+	for (auto &sd : p1d.diffs)
+		diffpairs[sd.sliderName].first = sd.diff;
+	for (auto &sd : p2d.diffs)
+		diffpairs[sd.sliderName].second = sd.diff;
+
+	for (auto &dp : diffpairs) {
+		// First, just average the diffs.
+		Vector3 diff = (dp.second.first + dp.second.second) * 0.5;
+		const SliderData &sd = activeSet[dp.first];
+		if (!sd.bUV && !sd.bClamp && !sd.bZap) {
+			// Calculate the distance between the moved p1 and p2.
+			float delen = (dp.second.second + p2 - dp.second.first - p1).length();
+			// Apply more curve offset (for delen > elen)
+			// or less (for delen < elen).
+			diff += usv.normal * (curveOffsetFactor * (delen - elen) * 0.5);
+		}
+		usv.diffs.push_back(UndoStateVertexSliderDiff{ dp.first, diff });
+		if (welded && !sd.bUV)
+			rusv.diffs.push_back(UndoStateVertexSliderDiff{ dp.first, diff });
+	}
+
+	if (welded) {
+		// Repeat the diff calculation, but only for UV diffs.
+		std::unordered_map<std::string, std::pair<Vector3, Vector3>> rdiffpairs;
+		for (auto &sd : rp1d.diffs)
+			rdiffpairs[sd.sliderName].first = sd.diff;
+		for (auto &sd : rp2d.diffs)
+			rdiffpairs[sd.sliderName].second = sd.diff;
+
+		for (auto &dp : rdiffpairs) {
+			const SliderData &sd = activeSet[dp.first];
+			if (!sd.bUV)
+				continue;
+			Vector3 diff = (dp.second.first + dp.second.second) * 0.5;
+			rusv.diffs.push_back(UndoStateVertexSliderDiff{ dp.first, diff });
+		}
+
+		uss.addVerts.push_back(std::move(rusv));
+	}
+
+	return true;
 }
 
 NiShape* OutfitProject::DuplicateShape(NiShape* sourceShape, const std::string& destShapeName) {
@@ -2283,7 +3084,7 @@ void OutfitProject::RenameShape(NiShape* shape, const std::string& newShapeName)
 	workNif.RenameShape(shape, newShapeName);
 	workAnim.RenameShape(shapeName, newShapeName);
 	activeSet.RenameShape(shapeName, newShapeName);
-	
+
 	auto tex = shapeTextures.find(shapeName);
 	if (tex != shapeTextures.end()) {
 		auto value = tex->second;
@@ -2616,7 +3417,7 @@ int OutfitProject::ImportOBJ(const std::string& fileName, const std::string& sha
 	return 0;
 }
 
-int OutfitProject::ExportOBJ(const std::string& fileName, const std::vector<NiShape*>& shapes, const Vector3& scale, const Vector3& offset) {
+int OutfitProject::ExportOBJ(const std::string& fileName, const std::vector<NiShape*>& shapes, bool transToGlobal, const Vector3& scale, const Vector3& offset) {
 	ObjFile obj;
 	obj.SetScale(scale);
 	obj.SetOffset(offset);
@@ -2633,8 +3434,24 @@ int OutfitProject::ExportOBJ(const std::string& fileName, const std::vector<NiSh
 		if (!verts)
 			return 3;
 
+
 		const std::vector<Vector2>* uvs = workNif.GetUvsForShape(shape);
 		const std::vector<Vector3>* norms = workNif.GetNormalsForShape(shape, false);
+
+		std::vector<Vector3> gVerts, gNorms;
+		if (transToGlobal) {
+			MatTransform toGlobal = workAnim.shapeSkinning[shape->GetName()].xformGlobalToSkin.InverseTransform();
+			gVerts.resize(verts->size());
+			for (int i = 0; i < gVerts.size(); ++i)
+				gVerts[i] = toGlobal.ApplyTransform((*verts)[i]);
+			verts = &gVerts;
+			if (norms) {
+				gNorms.resize(norms->size());
+				for (int i = 0; i < gNorms.size(); ++i)
+					gNorms[i] = toGlobal.rotation * (*norms)[i];
+				norms = &gNorms;
+			}
+		}
 
 		obj.AddGroup(shape->GetName(), *verts, tris, uvs ? *uvs : std::vector<Vector2>(), norms ? *norms : std::vector<Vector3>());
 	}

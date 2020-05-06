@@ -115,16 +115,16 @@ public:
 	void PrettySortBlocks();
 
 	template<class T = NiObject>
-	bool DeleteUnreferencedBlocks() {
+	int DeleteUnreferencedBlocks() {
 		if (hasUnknown)
-			return false;
+			return 0;
 
-		bool hadDeletions = false;
-		hdr.DeleteUnreferencedBlocks<T>(GetBlockID(GetRootNode()), &hadDeletions);
-		return hadDeletions;
+		int deletionCount = 0;
+		hdr.DeleteUnreferencedBlocks<T>(GetBlockID(GetRootNode()), &deletionCount);
+		return deletionCount;
 	}
 
-	void DeleteUnreferencedNodes(bool* hadDeletions = nullptr);
+	bool DeleteUnreferencedNodes(int* deletionCount = nullptr);
 
 	template<class T = NiObject>
 	T* FindBlockByName(const std::string& name);
@@ -180,6 +180,10 @@ public:
 	void SetShapeBoneIDList(NiShape* shape, std::vector<int>& inList);
 	int GetShapeBoneWeights(NiShape* shape, const int boneIndex, std::unordered_map<ushort, float>& outWeights);
 
+	// Looks up the shape's global-to-skin transform if it has it.
+	// Otherwise, try to calculate it using skin-to-bone and node-to-global
+	// transforms.  Returns false on failure.
+	bool CalcShapeTransformGlobalToSkin(NiShape* shape, MatTransform& outTransforms);
 	// Returns false if no such transform exists in the file, in which
 	// case outTransform will not be changed.  Note that, even if this
 	// function returns false, you can not assume that the global-to-skin
@@ -209,8 +213,8 @@ public:
 	void SetShapeVertWeights(const std::string& shapeName, const int vertIndex, std::vector<byte>& boneids, std::vector<float>& weights);
 	void ClearShapeVertWeights(const std::string& shapeName);
 
-	bool GetShapeSegments(NiShape* shape, BSSubIndexTriShape::BSSITSSegmentation& segmentation);
-	void SetShapeSegments(NiShape* shape, const BSSubIndexTriShape::BSSITSSegmentation& segmentation);
+	bool GetShapeSegments(NiShape* shape, NifSegmentationInfo& inf, std::vector<int>& triParts);
+	void SetShapeSegments(NiShape* shape, const NifSegmentationInfo& inf, const std::vector<int>& triParts);
 
 	bool GetShapePartitions(NiShape* shape, std::vector<BSDismemberSkinInstance::PartitionInfo>& partitionInfo, std::vector<int> &triParts);
 	void SetShapePartitions(NiShape* shape, const std::vector<BSDismemberSkinInstance::PartitionInfo>& partitionInfo, const std::vector<int> &triParts, const bool convertSkinInstance = true);
@@ -221,11 +225,17 @@ public:
 	const std::vector<Vector3>* GetNormalsForShape(NiShape* shape, bool transform = true);
 	const std::vector<Vector2>* GetUvsForShape(NiShape* shape);
 	const std::vector<Color4>* GetColorsForShape(const std::string& shapeName);
+	const std::vector<Vector3>* GetTangentsForShape(NiShape* shape, bool transform = true);
+	const std::vector<Vector3>* GetBitangentsForShape(NiShape* shape, bool transform = true);
+	std::vector<float>* GetEyeDataForShape(NiShape* shape);
 	bool GetUvsForShape(NiShape* shape, std::vector<Vector2>& outUvs);
 	bool GetVertsForShape(NiShape* shape, std::vector<Vector3>& outVerts);
 	void SetVertsForShape(NiShape* shape, const std::vector<Vector3>& verts);
 	void SetUvsForShape(NiShape* shape, const std::vector<Vector2>& uvs);
 	void SetColorsForShape(const std::string& shapeName, const std::vector<Color4>& colors);
+	void SetTangentsForShape(NiShape* shape, const std::vector<Vector3>& in);
+	void SetBitangentsForShape(NiShape* shape, const std::vector<Vector3>& in);
+	void SetEyeDataForShape(NiShape* shape, const std::vector<float>& in);
 	void InvertUVsForShape(NiShape* shape, bool invertX, bool invertY);
 	void MirrorShape(NiShape* shape, bool mirrorX, bool mirrorY, bool mirrorZ);
 	void SetNormalsForShape(NiShape* shape, const std::vector<Vector3>& norms);

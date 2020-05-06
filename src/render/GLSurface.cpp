@@ -485,7 +485,12 @@ bool GLSurface::CollidePlane(int ScreenX, int ScreenY, Vector3& outOrigin, const
 	return true;
 }
 
-bool GLSurface::UpdateCursor(int ScreenX, int ScreenY, bool allMeshes, std::string* hitMeshName, int* outHoverPoint, Vector3* outHoverColor, float* outHoverAlpha) {
+inline Vector3 ApplyMat4(const glm::mat4x4 &mat, const Vector3 &p) {
+	glm::vec3 gp(mat * glm::vec4(p.x, p.y, p.z, 1.0f));
+	return Vector3(gp.x, gp.y, gp.z);
+}
+
+bool GLSurface::UpdateCursor(int ScreenX, int ScreenY, bool allMeshes, std::string* hitMeshName, int* outHoverPoint, Vector3* outHoverColor, float* outHoverAlpha, Edge* outHoverEdge) {
 	bool collided = false;
 	if (activeMeshes.empty())
 		return collided;
@@ -567,17 +572,25 @@ bool GLSurface::UpdateCursor(int ScreenX, int ScreenY, bool allMeshes, std::stri
 					if (hitMeshName)
 						(*hitMeshName) = m->shapeName;
 
-					glm::vec3 orig(m->matModel * glm::vec4(origin.x, origin.y, origin.z, 1.0f));
-					origin = Vector3(orig.x, orig.y, orig.z);
+					Edge closestEdge = t.ClosestEdge(m->verts.get(), origin);
+					if (outHoverEdge)
+						*outHoverEdge = closestEdge;
+
+					Vector3 morigin = ApplyMat4(m->matModel, origin);
 
 					Vector3 norm;
 					m->tris[results[min_i].HitFacet].trinormal(m->verts.get(), &norm);
-					int ringID = AddVisCircle(origin, norm, cursorSize, "cursormesh");
-					overlays[ringID]->scale = 2.0f;
 
-					glm::vec3 hl(m->matModel * glm::vec4(hilitepoint.x, hilitepoint.y, hilitepoint.z, 1.0f));
-					AddVisPoint(Vector3(hl.x, hl.y, hl.z), "pointhilite");
-					AddVisPoint(origin, "cursorcenter")->color = Vector3(1.0f, 0.0f, 0.0f);
+					mesh* ringMesh = AddVisCircle(morigin, norm, cursorSize, "cursormesh");
+					ringMesh->scale = 2.0f;
+
+					Vector3 mhilitepoint = ApplyMat4(m->matModel, hilitepoint);
+					AddVisPoint(mhilitepoint, "pointhilite");
+					AddVisPoint(morigin, "cursorcenter")->color = Vector3(1.0f, 0.0f, 0.0f);
+
+					Vector3 mep1 = ApplyMat4(m->matModel, m->verts[closestEdge.p1]);
+					Vector3 mep2 = ApplyMat4(m->matModel, m->verts[closestEdge.p2]);
+					AddVisSeg(mep1, mep2, "seghilite");
 				}
 
 				allHitDistances[m] = hilitepoint;
@@ -631,7 +644,7 @@ bool GLSurface::GetCursorVertex(int ScreenX, int ScreenY, int* outIndex) {
 				if (nextdist < closestdist)
 					pointid = t.p3;
 
-				if (*outIndex)
+				if (outIndex)
 					(*outIndex) = pointid;
 
 				return true;
@@ -643,12 +656,22 @@ bool GLSurface::GetCursorVertex(int ScreenX, int ScreenY, int* outIndex) {
 }
 
 void GLSurface::ShowCursor(bool show) {
-	SetOverlayVisibility("cursormesh", show);
-	SetOverlayVisibility("pointhilite", show);
-	SetOverlayVisibility("cursorcenter", show);
+	SetOverlayVisibility("cursormesh", show && (cursorType & CircleCursor));
+	SetOverlayVisibility("pointhilite", show && (cursorType & PointCursor));
+	SetOverlayVisibility("cursorcenter", show && (cursorType & CenterCursor));
+	SetOverlayVisibility("seghilite", show && (cursorType & SegCursor));
+}
+
+void GLSurface::HidePointCursor() {
+	SetOverlayVisibility("pointhilite", false);
+}
+
+void GLSurface::HideSegCursor() {
+	SetOverlayVisibility("seghilite", false);
 }
 
 void GLSurface::SetSize(uint w, uint h) {
+	SetContext();
 	glViewport(0, 0, w, h);
 	vpW = w;
 	vpH = h;
@@ -744,6 +767,11 @@ void GLSurface::RenderToTexture(GLMaterial* renderShader) {
 
 }
 
+void GLSurface::SetContext() {
+	if (canvas && context)
+		canvas->SetCurrent(*context);
+}
+
 void GLSurface::RenderOneFrame() {
 	if (!canvas)
 		return;
@@ -804,6 +832,7 @@ void GLSurface::RenderMesh(mesh* m) {
 	shader.SetMatrixProjection(matProjection);
 	shader.SetMatrixModelView(matView, m->matModel);
 	shader.SetColor(m->color);
+	shader.SetSubColor(Vector3(1.0f, 1.0f, 1.0f));
 	shader.SetModelSpace(m->modelSpace);
 	shader.SetSpecularEnabled(m->specular);
 	shader.SetEmissive(m->emissive);
@@ -893,15 +922,58 @@ void GLSurface::RenderMesh(mesh* m) {
 		else
 			glPolygonOffset(0.03f, 0.03f);
 
-		// Render mesh
-		glDrawElements(GL_TRIANGLES, m->nTris * 3, GL_UNSIGNED_SHORT, (GLvoid*)0);
+		/* TESTING
+		m->subMeshes.clear();
+		m->subMeshesColor.clear();
+
+		m->subMeshes.push_back(std::make_pair(0, 1000));
+		m->subMeshes.push_back(std::make_pair(1000, 1000));
+		m->subMeshes.push_back(std::make_pair(2000, 1000));
+		m->subMeshes.push_back(std::make_pair(3000, 1000));
+
+		m->subMeshesColor.push_back(Vector3(1, 0, 0));
+		m->subMeshesColor.push_back(Vector3(0, 1, 0));
+		m->subMeshesColor.push_back(Vector3(0, 0, 1));
+		m->subMeshesColor.push_back(Vector3(1, 1, 0));
+		*/
+
+		GLuint subMeshesSize = 0;
+		if (!m->subMeshes.empty()) {
+			auto& lastSubMesh = m->subMeshes.back();
+			subMeshesSize = lastSubMesh.first + lastSubMesh.second;
+		}
+
+		// Render full mesh or remainder of it
+		glDrawElements(GL_TRIANGLES, (m->nTris - subMeshesSize) * 3, GL_UNSIGNED_SHORT, (GLvoid*)(subMeshesSize * 3 * sizeof(GLushort)));
+
+		// Render sub meshes
+		for (int s = 0; s < m->subMeshes.size(); ++s) {
+			GLuint subIndex = m->subMeshes[s].first;
+			GLuint subSize = m->subMeshes[s].second;
+			Vector3 subColor = m->color;
+
+			if (!m->subMeshesColor.empty())
+				subColor = m->subMeshesColor[s];
+
+			shader.SetSubColor(subColor);
+			glDrawElements(GL_TRIANGLES, subSize * 3, GL_UNSIGNED_SHORT, (GLvoid*)(subIndex * 3 * sizeof(GLushort)));
+		}
+
 		glDisable(GL_POLYGON_OFFSET_FILL);
 
-		// Render wireframe
+		// Render wireframe (full mesh or remainder of it)
 		if (bWireframe && m->rendermode == RenderMode::Normal) {
 			shader.SetWireframeEnabled(true);
+			shader.SetColor(colorWire);
 			glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-			glDrawElements(GL_TRIANGLES, m->nTris * 3, GL_UNSIGNED_SHORT, (GLvoid*)0);
+			glDrawElements(GL_TRIANGLES, (m->nTris - subMeshesSize) * 3, GL_UNSIGNED_SHORT, (GLvoid*)(subMeshesSize * 3 * sizeof(GLushort)));
+
+			// Render wireframes for sub meshes
+			for (int s = 0; s < m->subMeshes.size(); ++s) {
+				GLuint subIndex = m->subMeshes[s].first;
+				GLuint subSize = m->subMeshes[s].second;
+				glDrawElements(GL_TRIANGLES, subSize * 3, GL_UNSIGNED_SHORT, (GLvoid*)(subIndex * 3 * sizeof(GLushort)));
+			}
 		}
 
 		if (bTextured && m->textured && m->texcoord)
@@ -967,7 +1039,6 @@ void GLSurface::UpdateShaders(mesh* m) {
 		shader.ShowWeight(bWeightColors && m->vcolors);
 		shader.ShowVertexColors(bVertexColors && m->vcolors && m->vertexColors);
 		shader.ShowVertexAlpha(bVertexColors && m->valpha && m->vertexColors && m->vertexAlpha);
-		shader.ShowSegments(bSegmentColors && m->vcolors);
 		shader.SetProperties(m->prop);
 	}
 }
@@ -1012,18 +1083,9 @@ mesh* GLSurface::AddMeshFromNif(NifFile* nif, const std::string& shapeName, Vect
 		m->matModel = matShape;
 	}
 	else {
-		// Not rendered by the game for skinned meshes
-		// Keep to counter-offset bone transforms
-		MatTransform xFormSkin;
-		auto matSkin = glm::identity<glm::mat4x4>();
-		if (nif->GetShapeTransformGlobalToSkin(shape, xFormSkin)) {
-			float y, p, r;
-			xFormSkin.rotation.ToEulerAngles(y, p, r);
-			matSkin = glm::translate(matSkin, glm::vec3(xFormSkin.translation.x / -10.0f, xFormSkin.translation.z / 10.0f, xFormSkin.translation.y / 10.0f));
-			matSkin *= glm::yawPitchRoll(r, p, y);
-			matSkin = glm::scale(matSkin, glm::vec3(xFormSkin.scale, xFormSkin.scale, xFormSkin.scale));
-		}
-		m->matModel = glm::inverse(matSkin);
+		// For skinned meshes, SetSkinModelMat should be called with an
+		// appropriate global-to-skin transform.
+		m->matModel = glm::identity<glm::mat4x4>();
 	}
 
 
@@ -1151,32 +1213,8 @@ mesh* GLSurface::AddMeshFromNif(NifFile* nif, const std::string& shapeName, Vect
 		for (int t = 0; t < m->nTris; t++)
 			m->tris[t] = nifTris[t];
 
-		// Face normals
-		m->FacetNormals();
-
-		// Smooth normals
-		if (m->smoothSeamNormals) {
-			kd_matcher matcher(m->verts.get(), m->nVerts);
-			for (int i = 0; i < matcher.matches.size(); i++) {
-				std::pair<Vector3*, int>& a = matcher.matches[i].first;
-				std::pair<Vector3*, int>& b = matcher.matches[i].second;
-				m->weldVerts[a.second].push_back(b.second);
-				m->weldVerts[b.second].push_back(a.second);
-
-				Vector3& an = m->norms[a.second];
-				Vector3& bn = m->norms[b.second];
-				if (an.angle(bn) < 60.0f * DEG2RAD) {
-					Vector3 anT = an;
-					an += bn;
-					bn += anT;
-				}
-			}
-
-			for (int i = 0; i < m->nVerts; i++) {
-				Vector3& pn = m->norms[i];
-				pn.Normalize();
-			}
-		}
+		// Calc weldVerts and normals
+		m->SmoothNormals();
 	}
 	else {
 		// Already have normals, just copy the data over.
@@ -1193,13 +1231,7 @@ mesh* GLSurface::AddMeshFromNif(NifFile* nif, const std::string& shapeName, Vect
 		}
 
 		// Virtually weld verts across UV seams
-		kd_matcher matcher(m->verts.get(), m->nVerts);
-		for (int i = 0; i < matcher.matches.size(); i++) {
-			std::pair<Vector3*, int>& a = matcher.matches[i].first;
-			std::pair<Vector3*, int>& b = matcher.matches[i].second;
-			m->weldVerts[a.second].push_back(b.second);
-			m->weldVerts[b.second].push_back(a.second);
-		}
+		m->CalcWeldVerts();
 	}
 
 	m->CalcTangentSpace();
@@ -1218,13 +1250,18 @@ mesh* GLSurface::AddMeshFromNif(NifFile* nif, const std::string& shapeName, Vect
 		}
 	}
 
-	// Offset camera for skinned FO4 shapes
-	if (nif->GetHeader().GetVersion().User() == 12 && nif->GetHeader().GetVersion().Stream() == 130) {
-		if (shape && shape->IsSkinned())
-			camOffset.y = 12.0f;
-	}
-
 	return m;
+}
+
+void GLSurface::SetSkinModelMat(mesh *m, const MatTransform &xformGlobalToSkin) {
+	const MatTransform &xf = xformGlobalToSkin;
+	auto matSkin = glm::identity<glm::mat4x4>();
+	float y, p, r;
+	xf.rotation.ToEulerAngles(y, p, r);
+	matSkin = glm::translate(matSkin, glm::vec3(xf.translation.x / -10.0f, xf.translation.z / 10.0f, xf.translation.y / 10.0f));
+	matSkin *= glm::yawPitchRoll(r, p, y);
+	matSkin = glm::scale(matSkin, glm::vec3(xf.scale, xf.scale, xf.scale));
+	m->matModel = glm::inverse(matSkin);
 }
 
 mesh* GLSurface::AddVisPoint(const Vector3& p, const std::string& name, const Vector3* color) {
@@ -1240,6 +1277,8 @@ mesh* GLSurface::AddVisPoint(const Vector3& p, const std::string& name, const Ve
 		m->QueueUpdate(mesh::UpdateType::Position);
 		return m;
 	}
+
+	SetContext();
 
 	m = new mesh();
 
@@ -1260,15 +1299,31 @@ mesh* GLSurface::AddVisPoint(const Vector3& p, const std::string& name, const Ve
 	return m;
 }
 
-int GLSurface::AddVisCircle(const Vector3& center, const Vector3& normal, float radius, const std::string& name) {
+mesh* GLSurface::AddVisCircle(const Vector3& center, const Vector3& normal, float radius, const std::string& name) {
 	Matrix4 rotMat;
-	int ringMesh = GetOverlayID(name);
-	if (ringMesh >= 0)
-		delete overlays[ringMesh];
-	else
-		ringMesh = -1;
+	rotMat.Align(Vector3(0.0f, 0.0f, 1.0f), normal);
+	rotMat.Translate(center);
 
-	mesh* m = new mesh();
+	float rStep = DEG2RAD * 5.0f;
+
+	mesh* m = GetOverlay(name);
+	if (m) {
+		float i = 0.0f;
+		for (int j = 0; j < m->nVerts; j++) {
+			m->verts[j].x = sin(i) * radius;
+			m->verts[j].y = cos(i) * radius;
+			m->verts[j].z = 0;
+			i += rStep;
+			m->verts[j] = rotMat * m->verts[j];
+		}
+
+		m->QueueUpdate(mesh::UpdateType::Position);
+		return m;
+	}
+
+	SetContext();
+
+	m = new mesh();
 
 	m->nVerts = 360 / 5;
 	m->nEdges = m->nVerts;
@@ -1281,10 +1336,6 @@ int GLSurface::AddVisCircle(const Vector3& center, const Vector3& normal, float 
 	m->rendermode = RenderMode::UnlitWire;
 	m->material = GetPrimitiveMaterial();
 
-	rotMat.Align(Vector3(0.0f, 0.0f, 1.0f), normal);
-	rotMat.Translate(center);
-
-	float rStep = DEG2RAD * 5.0f;
 	float i = 0.0f;
 	for (int j = 0; j < m->nVerts; j++) {
 		m->verts[j].x = sin(i) * radius;
@@ -1299,18 +1350,15 @@ int GLSurface::AddVisCircle(const Vector3& center, const Vector3& normal, float 
 	m->edges[m->nEdges - 1].p2 = 0;
 	m->CreateBuffers();
 
-	if (ringMesh >= 0) {
-		overlays[ringMesh] = m;
-	}
-	else {
-		namedOverlays[m->shapeName] = overlays.size();
-		overlays.push_back(m);
-		ringMesh = overlays.size() - 1;
-	}
-	return ringMesh;
+	namedOverlays[m->shapeName] = overlays.size();
+	overlays.push_back(m);
+
+	return m;
 }
 
 mesh* GLSurface::AddVis3dRing(const Vector3& center, const Vector3& normal, float holeRadius, float ringRadius, const Vector3& color, const std::string& name) {
+	SetContext();
+
 	const int nRingSegments = 36;
 	const int nRingSteps = 4;
 
@@ -1408,6 +1456,8 @@ mesh* GLSurface::AddVis3dRing(const Vector3& center, const Vector3& normal, floa
 
 
 mesh* GLSurface::AddVis3dArrow(const Vector3& origin, const Vector3& direction, float stemRadius, float pointRadius, float length, const Vector3& color, const std::string& name) {
+	SetContext();
+
 	const int nRingVerts = 36;
 	Matrix4 rotMat;
 
@@ -1504,6 +1554,8 @@ mesh* GLSurface::AddVis3dArrow(const Vector3& origin, const Vector3& direction, 
 }
 
 mesh* GLSurface::AddVis3dCube(const Vector3& center, const Vector3& normal, float radius, const Vector3& color, const std::string& name) {
+	SetContext();
+
 	const int nCubeVerts = 8;
 	const int nCubeTris = 12;
 	mesh* m = nullptr;
@@ -1563,6 +1615,8 @@ mesh* GLSurface::AddVis3dCube(const Vector3& center, const Vector3& normal, floa
 }
 
 mesh* GLSurface::AddVisPlane(const Vector3& center, const Vector2& size, float uvScale, float uvOffset, const std::string& name, const Vector3* color) {
+	SetContext();
+
 	mesh* m = nullptr;
 
 	int meshID = GetOverlayID(name);
@@ -1608,6 +1662,40 @@ mesh* GLSurface::AddVisPlane(const Vector3& center, const Vector2& size, float u
 	m->tris[1] = Triangle(2, 3, 0);
 
 	m->CreateBuffers();
+	return m;
+}
+
+mesh* GLSurface::AddVisSeg(const Vector3& p1, const Vector3& p2, const std::string& name) {
+	mesh* m = GetOverlay(name);
+	if (m) {
+		m->verts[0] = p1;
+		m->verts[1] = p2;
+		m->bVisible = true;
+		m->QueueUpdate(mesh::UpdateType::Position);
+		return m;
+	}
+
+	SetContext();
+
+	m = new mesh();
+
+	m->nVerts = 2;
+	m->nEdges = 1;
+	m->verts = std::make_unique<Vector3[]>(2);
+	m->edges = std::make_unique<Edge[]>(1);
+	m->verts[0] = p1;
+	m->verts[1] = p2;
+	m->edges[0].p1 = 0;
+	m->edges[0].p2 = 1;
+
+	m->shapeName = name;
+	m->color = Vector3(0.0f, 1.0f, 1.0f);
+	m->rendermode = RenderMode::UnlitWire;
+	m->material = GetPrimitiveMaterial();
+	m->CreateBuffers();
+
+	namedOverlays[m->shapeName] = overlays.size();
+	overlays.push_back(m);
 	return m;
 }
 
@@ -1745,6 +1833,8 @@ RenderMode GLSurface::SetMeshRenderMode(const std::string& name, RenderMode mode
 }
 
 GLMaterial* GLSurface::AddMaterial(const std::vector<std::string>& textureFiles, const std::string& vShaderFile, const std::string& fShaderFile, const bool reloadTextures) {
+	SetContext();
+
 	GLMaterial* mat = resLoader.AddMaterial(textureFiles, vShaderFile, fShaderFile, reloadTextures);
 	if (mat) {
 		std::string shaderError;
@@ -1759,6 +1849,7 @@ GLMaterial* GLSurface::AddMaterial(const std::vector<std::string>& textureFiles,
 
 GLMaterial* GLSurface::GetPrimitiveMaterial() {
 	if (!primitiveMat) {
+		SetContext();
 		primitiveMat = new GLMaterial(Config["AppDir"] + "/res/shaders/primitive.vert", Config["AppDir"] + "/res/shaders/primitive.frag");
 
 		std::string shaderError;

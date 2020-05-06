@@ -981,9 +981,11 @@ void BodySlideApp::UpdatePreview() {
 			ApplySliders(it->second.targetShape, sliderManager.slidersSmall, vertsLow, zapIdx, &uvsLow);
 
 		// Calculate result of weight
+		auto uvsz = uvs.size();
 		for (int i = 0; i < verts.size(); i++) {
 			verts[i] = (vertsHigh[i] / 100.0f * weight) + (vertsLow[i] / 100.0f * (100.0f - weight));
-			uvs[i] = (uvsHigh[i] / 100.0f * weight) + (uvsLow[i] / 100.0f * (100.0f - weight));
+			if (uvsz > i)
+				uvs[i] = (uvsHigh[i] / 100.0f * weight) + (uvsLow[i] / 100.0f * (100.0f - weight));
 		}
 
 		// Zap deleted verts before applying to the shape
@@ -3262,7 +3264,7 @@ void BodySlideFrame::OnBatchBuildSelect(wxCommandEvent& event) {
 	}
 	else if (event.GetId() == XRCID("batchBuildInvert")) {
 		for (int i = 0; i < batchBuildList->GetCount(); i++)
-			batchBuildList->Check(!batchBuildList->IsChecked(i));
+			batchBuildList->Check(i, !batchBuildList->IsChecked(i));
 	}
 }
 
@@ -3382,6 +3384,14 @@ void BodySlideFrame::OnSettings(wxCommandEvent& WXUNUSED(event)) {
 			cpColorBackground->SetColour(wxColour(colorBackgroundR, colorBackgroundG, colorBackgroundB));
 		}
 
+		wxColourPickerCtrl* cpColorWire = XRCCTRL(*settings, "cpColorWire", wxColourPickerCtrl);
+		if (Config.Exists("Rendering/ColorWire")) {
+			int colorWireR = Config.GetIntValue("Rendering/ColorWire.r");
+			int colorWireG = Config.GetIntValue("Rendering/ColorWire.g");
+			int colorWireB = Config.GetIntValue("Rendering/ColorWire.b");
+			cpColorWire->SetColour(wxColour(colorWireR, colorWireG, colorWireB));
+		}
+
 		wxFilePickerCtrl* fpSkeletonFile = XRCCTRL(*settings, "fpSkeletonFile", wxFilePickerCtrl);
 		fpSkeletonFile->SetPath(Config["Anim/DefaultSkeletonReference"]);
 
@@ -3431,6 +3441,11 @@ void BodySlideFrame::OnSettings(wxCommandEvent& WXUNUSED(event)) {
 			Config.SetValue("Rendering/ColorBackground.r", colorBackground.Red());
 			Config.SetValue("Rendering/ColorBackground.g", colorBackground.Green());
 			Config.SetValue("Rendering/ColorBackground.b", colorBackground.Blue());
+
+			wxColour colorWire = cpColorWire->GetColour();
+			Config.SetValue("Rendering/ColorWire.r", colorWire.Red());
+			Config.SetValue("Rendering/ColorWire.g", colorWire.Green());
+			Config.SetValue("Rendering/ColorWire.b", colorWire.Blue());
 
 			wxFileName skeletonFile = fpSkeletonFile->GetFileName();
 			Config.SetValue("Anim/DefaultSkeletonReference", skeletonFile.GetFullPath().ToStdString());

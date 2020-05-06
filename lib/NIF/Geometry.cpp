@@ -277,7 +277,7 @@ void NiGeometryData::UpdateBounds() {
 	bounds = BoundingSphere(vertices);
 }
 
-void NiGeometryData::Create(std::vector<Vector3>* verts, std::vector<Triangle>*, std::vector<Vector2>* texcoords, std::vector<Vector3>* norms) {
+void NiGeometryData::Create(const std::vector<Vector3>* verts, const std::vector<Triangle>*, const std::vector<Vector2>* texcoords, const std::vector<Vector3>* norms) {
 	size_t vertCount = verts->size();
 	ushort maxIndex = std::numeric_limits<ushort>().max();
 
@@ -291,19 +291,21 @@ void NiGeometryData::Create(std::vector<Vector3>* verts, std::vector<Triangle>*,
 		vertices[v] = (*verts)[v];
 
 	bounds = BoundingSphere(*verts);
-	numUVSets = 0;
 
 	if (texcoords) {
 		size_t uvCount = texcoords->size();
 		if (uvCount == numVertices) {
-			uvSets.resize(1);
-			uvSets[0].resize(uvCount);
+			SetUVs(true);
+
 			for (size_t uv = 0; uv < uvSets[0].size(); uv++)
 				uvSets[0][uv] = (*texcoords)[uv];
-
-			if (uvCount > 0)
-				numUVSets = 4097;
 		}
+		else {
+			SetUVs(false);
+		}
+	}
+	else {
+		SetUVs(false);
 	}
 
 	if (norms && norms->size() == numVertices) {
@@ -492,6 +494,26 @@ int NiShape::GetBoneID(NiHeader& hdr, const std::string& boneName) {
 	}
 
 	return 0xFFFFFFFF;
+}
+
+bool NiShape::ReorderTriangles(const std::vector<uint>& triInds) {
+	std::vector<Triangle> trisOrdered;
+	std::vector<Triangle> tris;
+	if (!GetTriangles(tris))
+		return false;
+
+	if (tris.size() != triInds.size())
+		return false;
+
+	for (uint id : triInds)
+		if (id < tris.size())
+			trisOrdered.push_back(tris[id]);
+
+	if (trisOrdered.size() != tris.size())
+		return false;
+
+	SetTriangles(trisOrdered);
+	return true;
 }
 
 
@@ -795,6 +817,8 @@ void BSTriShape::notifyVerticesDelete(const std::vector<ushort>& vertIndices) {
 
 	ApplyMapToTriangles(triangles, indexCollapse, &deletedTris);
 	numTriangles = triangles.size();
+
+	std::sort(deletedTris.begin(), deletedTris.end(), std::greater<>());
 }
 
 void BSTriShape::GetChildRefs(std::set<Ref*>& refs) {
@@ -945,6 +969,17 @@ std::vector<Color4>* BSTriShape::GetColorData() {
 	return &rawColors;
 }
 
+std::vector<float>* BSTriShape::GetEyeData() {
+	if (!HasEyeData())
+		return nullptr;
+
+	rawEyeData.resize(numVertices);
+	for (int i = 0; i < numVertices; ++i)
+		rawEyeData[i] = vertData[i].eyeData;
+
+	return &rawEyeData;
+}
+
 ushort BSTriShape::GetNumVertices() {
 	return numVertices;
 }
@@ -1072,49 +1107,90 @@ void BSTriShape::SetNormals(const std::vector<Vector3>& inNorms) {
 	}
 }
 
+void BSTriShape::SetTangentData(const std::vector<Vector3>& in) {
+	SetTangents(true);
+
+	for (int i = 0; i < numVertices; i++) {
+		vertData[i].tangent[0] = (unsigned char)round((((in[i].x + 1.0f) / 2.0f) * 255.0f));
+		vertData[i].tangent[1] = (unsigned char)round((((in[i].y + 1.0f) / 2.0f) * 255.0f));
+		vertData[i].tangent[2] = (unsigned char)round((((in[i].z + 1.0f) / 2.0f) * 255.0f));
+	}
+}
+
+void BSTriShape::SetBitangentData(const std::vector<Vector3>& in) {
+	SetTangents(true);
+
+	for (int i = 0; i < numVertices; i++) {
+		vertData[i].bitangentX = in[i].x;
+		vertData[i].bitangentY = (unsigned char)round((((in[i].y + 1.0f) / 2.0f) * 255.0f));
+		vertData[i].bitangentZ = (unsigned char)round((((in[i].z + 1.0f) / 2.0f) * 255.0f));
+	}
+}
+
+void BSTriShape::SetEyeData(const std::vector<float>& in) {
+	SetEyeData(true);
+
+	for (int i = 0; i < numVertices; i++)
+		vertData[i].eyeData = in[i];
+}
+
+static void CalculateNormals(const std::vector<Vector3> &verts, const std::vector<Triangle> &tris, std::vector<Vector3> &norms, const bool smooth, float smoothThresh) {
+	// Zero norms
+	norms.clear();
+	norms.resize(verts.size());
+
+	// Face normals
+	for (const Triangle &t : tris) {
+		Vector3 tn;
+		t.trinormal(verts, &tn);
+		norms[t.p1] += tn;
+		norms[t.p2] += tn;
+		norms[t.p3] += tn;
+	}
+
+	for (Vector3 &n : norms)
+		n.Normalize();
+
+	// Smooth normals
+	if (smooth) {
+		smoothThresh *= DEG2RAD;
+		std::vector<Vector3> seamNorms;
+		SortingMatcher matcher(verts.data(), verts.size());
+		for (const std::vector<int> &matchset : matcher.matches) {
+			seamNorms.resize(matchset.size());
+			for (int j = 0; j < matchset.size(); ++j) {
+				const Vector3 &n = norms[matchset[j]];
+				Vector3 sn = n;
+				for (int k = 0; k < matchset.size(); ++k) {
+					if (j == k)
+						continue;
+					const Vector3 &mn = norms[matchset[k]];
+					if (n.angle(mn) >= smoothThresh)
+						continue;
+					sn += mn;
+				}
+				sn.Normalize();
+				seamNorms[j] = sn;
+			}
+			for (int j = 0; j < matchset.size(); ++j)
+				norms[matchset[j]] = seamNorms[j];
+		}
+	}
+}
+
 void BSTriShape::RecalcNormals(const bool smooth, const float smoothThresh) {
 	GetRawVerts();
 	SetNormals(true);
 
 	std::vector<Vector3> verts(numVertices);
-	std::vector<Vector3> norms(numVertices);
 	for (int i = 0; i < numVertices; i++) {
 		verts[i].x = rawVertices[i].x * -0.1f;
 		verts[i].z = rawVertices[i].y * 0.1f;
 		verts[i].y = rawVertices[i].z * 0.1f;
 	}
 
-	// Face normals
-	Vector3 tn;
-	for (int t = 0; t < numTriangles; t++) {
-		triangles[t].trinormal(verts, &tn);
-		norms[triangles[t].p1] += tn;
-		norms[triangles[t].p2] += tn;
-		norms[triangles[t].p3] += tn;
-	}
-
-	for (auto &n : norms)
-		n.Normalize();
-
-	// Smooth normals
-	if (smooth) {
-		kd_matcher matcher(verts.data(), numVertices);
-		for (int i = 0; i < matcher.matches.size(); i++) {
-			std::pair<Vector3*, int>& a = matcher.matches[i].first;
-			std::pair<Vector3*, int>& b = matcher.matches[i].second;
-
-			Vector3& an = norms[a.second];
-			Vector3& bn = norms[b.second];
-			if (an.angle(bn) < smoothThresh * DEG2RAD) {
-				Vector3 anT = an;
-				an += bn;
-				bn += anT;
-			}
-		}
-
-		for (auto &n : norms)
-			n.Normalize();
-	}
+	std::vector<Vector3> norms;
+	CalculateNormals(verts, triangles, norms, smooth, smoothThresh);
 
 	rawNormals.resize(numVertices);
 	for (int i = 0; i < numVertices; i++) {
@@ -1276,7 +1352,7 @@ int BSTriShape::CalcDataSizes(NiVersion& version) {
 	return dataSize;
 }
 
-void BSTriShape::Create(std::vector<Vector3>* verts, std::vector<Triangle>* tris, std::vector<Vector2>* uvs, std::vector<Vector3>* normals) {
+void BSTriShape::Create(const std::vector<Vector3>* verts, const std::vector<Triangle>* tris, const std::vector<Vector2>* uvs, const std::vector<Vector3>* normals) {
 	flags = 14;
 
 	ushort maxVertIndex = std::numeric_limits<ushort>().max();
@@ -1287,7 +1363,7 @@ void BSTriShape::Create(std::vector<Vector3>* verts, std::vector<Triangle>* tris
 		numVertices = ushort(vertCount);
 
 	uint maxTriIndex = std::numeric_limits<uint>().max();
-	size_t triCount = tris->size();
+	size_t triCount = tris ? tris->size() : 0;
 	if (triCount > maxTriIndex || numVertices == 0)
 		numTriangles = 0;
 	else
@@ -1529,12 +1605,156 @@ void BSSubIndexTriShape::SetDefaultSegments() {
 	segments.clear();
 }
 
-void BSSubIndexTriShape::Create(std::vector<Vector3>* verts, std::vector<Triangle>* tris, std::vector<Vector2>* uvs, std::vector<Vector3>* normals) {
+void BSSubIndexTriShape::Create(const std::vector<Vector3>* verts, const std::vector<Triangle>* tris, const std::vector<Vector2>* uvs, const std::vector<Vector3>* normals) {
 	BSTriShape::Create(verts, tris, uvs, normals);
 
 	// Skinned most of the time
 	SetSkinned(true);
 	SetDefaultSegments();
+}
+
+void BSSubIndexTriShape::GetSegmentation(NifSegmentationInfo &inf, std::vector<int> &triParts) {
+	inf.segs.clear();
+	inf.ssfFile = segmentation.subSegmentData.ssfFile.GetString();
+	inf.segs.resize(segmentation.segments.size());
+	triParts.clear();
+
+	uint numTris = GetNumTriangles();
+	triParts.resize(numTris, -1);
+
+	int partID = 0;
+	int arrayIndex = 0;
+
+	for (int i = 0; i < segmentation.segments.size(); ++i) {
+		BSSITSSegment &seg = segmentation.segments[i];
+		uint startIndex = seg.startIndex / 3;
+		uint endIndex = std::min(numTris, startIndex + seg.numPrimitives);
+
+		for (uint id = startIndex; id < endIndex; id++)
+			triParts[id] = partID;
+
+		inf.segs[i].partID = partID++;
+		inf.segs[i].subs.resize(seg.subSegments.size());
+
+		for (int j = 0; j < seg.subSegments.size(); ++j) {
+			BSSITSSubSegment &sub = seg.subSegments[j];
+			startIndex = sub.startIndex / 3;
+
+			endIndex = std::min(numTris, startIndex + sub.numPrimitives);
+			for (uint id = startIndex; id < endIndex; id++)
+				triParts[id] = partID;
+
+			inf.segs[i].subs[j].partID = partID++;
+			arrayIndex++;
+
+			BSSITSSubSegmentDataRecord &rec = segmentation.subSegmentData.dataRecords[arrayIndex];
+			inf.segs[i].subs[j].userSlotID = rec.userSlotID < 30 ? 0 : rec.userSlotID;
+			inf.segs[i].subs[j].material = rec.material;
+			inf.segs[i].subs[j].extraData = rec.extraData;
+		}
+		arrayIndex++;
+	}
+}
+
+void BSSubIndexTriShape::SetSegmentation(const NifSegmentationInfo &inf, const std::vector<int> &inTriParts) {
+	uint numTris = GetNumTriangles();
+	if (inTriParts.size() != numTris)
+		return;
+
+	// Renumber partitions so that the partition IDs are increasing.
+	int newPartID = 0;
+	std::vector<int> oldToNewPartIDs;
+	for (const NifSegmentInfo &seg : inf.segs) {
+		if (seg.partID >= oldToNewPartIDs.size())
+			oldToNewPartIDs.resize(seg.partID + 1);
+
+		oldToNewPartIDs[seg.partID] = newPartID++;
+		for (const NifSubSegmentInfo &sub : seg.subs) {
+			if (sub.partID >= oldToNewPartIDs.size())
+				oldToNewPartIDs.resize(sub.partID + 1);
+			oldToNewPartIDs[sub.partID] = newPartID++;
+		}
+	}
+
+	std::vector<int> triParts(numTris);
+	for (int i = 0; i < numTris; ++i)
+		if (triParts[i] >= 0)
+			triParts[i] = oldToNewPartIDs[inTriParts[i]];
+
+	// Sort triangles by partition ID
+	std::vector<uint> triInds(numTris);
+	for (int i = 0; i < numTris; ++i)
+		triInds[i] = i;
+
+	std::stable_sort(triInds.begin(), triInds.end(), [&triParts](int i, int j) {
+		return triParts[i] < triParts[j];
+	});
+
+	ReorderTriangles(triInds);
+	// Note that triPart's indexing no longer matches triangle indexing.
+
+	// Find first triangle of each partition
+	std::vector<int> partTriInds(newPartID + 1);
+	for (int i = 0, j = 0; i < triInds.size(); ++i)
+		while (triParts[triInds[i]] >= j)
+			partTriInds[j++] = i;
+
+	partTriInds.back() = triInds.size();
+
+	segmentation = std::move(BSSITSSegmentation());
+	uint parentArrayIndex = 0;
+	uint segmentIndex = 0;
+	int partID = 0;
+
+	for (const NifSegmentInfo &seg : inf.segs) {
+		// Create new segment
+		segmentation.segments.emplace_back();
+		BSSITSSegment &segment = segmentation.segments.back();
+		int childCount = seg.subs.size();
+		segment.numPrimitives = partTriInds[partID + childCount + 1] - partTriInds[partID];
+		segment.startIndex = partTriInds[partID] * 3;
+		segment.numSubSegments = childCount;
+		++partID;
+
+		// Create new segment data record
+		BSSITSSubSegmentDataRecord segmentDataRecord;
+		segmentDataRecord.userSlotID = segmentIndex;
+		segmentation.subSegmentData.arrayIndices.push_back(parentArrayIndex);
+		segmentation.subSegmentData.dataRecords.push_back(segmentDataRecord);
+
+		uint subSegmentNumber = 1;
+		for (const NifSubSegmentInfo &sub : seg.subs) {
+			// Create new subsegment
+			segment.subSegments.emplace_back();
+			BSSITSSubSegment &subSegment = segment.subSegments.back();
+			subSegment.arrayIndex = parentArrayIndex;
+			subSegment.numPrimitives = partTriInds[partID + 1] - partTriInds[partID];
+			subSegment.startIndex = partTriInds[partID] * 3;
+			++partID;
+
+			// Create new subsegment data record
+			BSSITSSubSegmentDataRecord subSegmentDataRecord;
+			if (sub.userSlotID < 30)
+				subSegmentDataRecord.userSlotID = subSegmentNumber++;
+			else
+				subSegmentDataRecord.userSlotID = sub.userSlotID;
+
+			subSegmentDataRecord.material = sub.material;
+			subSegmentDataRecord.numData = sub.extraData.size();
+			subSegmentDataRecord.extraData = sub.extraData;
+			segmentation.subSegmentData.dataRecords.push_back(subSegmentDataRecord);
+		}
+
+		parentArrayIndex += childCount + 1;
+		++segmentIndex;
+	}
+
+	segmentation.numPrimitives = numTris;
+	segmentation.numSegments = segmentIndex;
+	segmentation.numTotalSegments = parentArrayIndex;
+	segmentation.subSegmentData.numSegments = segmentIndex;
+	segmentation.subSegmentData.numTotalSegments = parentArrayIndex;
+	segmentation.subSegmentData.ssfFile.SetString(inf.ssfFile);
 }
 
 
@@ -1615,7 +1835,7 @@ void BSDynamicTriShape::CalcDynamicData() {
 	}
 }
 
-void BSDynamicTriShape::Create(std::vector<Vector3>* verts, std::vector<Triangle>* tris, std::vector<Vector2>* uvs, std::vector<Vector3>* normals) {
+void BSDynamicTriShape::Create(const std::vector<Vector3>* verts, const std::vector<Triangle>* tris, const std::vector<Vector2>* uvs, const std::vector<Vector3>* normals) {
 	BSTriShape::Create(verts, tris, uvs, normals);
 
 	uint maxIndex = std::numeric_limits<uint>().max();
@@ -1768,12 +1988,12 @@ void NiTriBasedGeomData::Put(NiStream& stream) {
 	stream << numTriangles;
 }
 
-void NiTriBasedGeomData::Create(std::vector<Vector3>* verts, std::vector<Triangle>* inTris, std::vector<Vector2>* texcoords, std::vector<Vector3>* norms) {
+void NiTriBasedGeomData::Create(const std::vector<Vector3>* verts, const std::vector<Triangle>* inTris, const std::vector<Vector2>* texcoords, const std::vector<Vector3>* norms) {
 	NiGeometryData::Create(verts, inTris, texcoords, norms);
 
 	if (inTris) {
 		ushort maxIndex = std::numeric_limits<ushort>().max();
-		size_t triCount = inTris->size();
+		size_t triCount = inTris ? inTris->size() : 0;
 		if (triCount <= maxIndex && numVertices != 0)
 			numTriangles = ushort(triCount);
 		else
@@ -1830,7 +2050,7 @@ void NiTriShapeData::Put(NiStream& stream) {
 	}
 }
 
-void NiTriShapeData::Create(std::vector<Vector3>* verts, std::vector<Triangle>* inTris, std::vector<Vector2>* texcoords, std::vector<Vector3>* norms) {
+void NiTriShapeData::Create(const std::vector<Vector3>* verts, const std::vector<Triangle>* inTris, const std::vector<Vector2>* texcoords, const std::vector<Vector3>* norms) {
 	NiTriBasedGeomData::Create(verts, inTris, texcoords, norms);
 
 	if (numTriangles > 0) {
@@ -1842,9 +2062,11 @@ void NiTriShapeData::Create(std::vector<Vector3>* verts, std::vector<Triangle>* 
 		hasTriangles = false;
 	}
 
-	triangles.resize(numTriangles);
-	for (ushort t = 0; t < numTriangles; t++)
-		triangles[t] = (*inTris)[t];
+	if (inTris) {
+		triangles.resize(numTriangles);
+		for (ushort t = 0; t < numTriangles; t++)
+			triangles[t] = (*inTris)[t];
+	}
 
 	numMatchGroups = 0;
 }
@@ -1880,41 +2102,7 @@ void NiTriShapeData::RecalcNormals(const bool smooth, const float smoothThresh) 
 
 	NiTriBasedGeomData::RecalcNormals();
 
-	// Zero out existing normals
-	for (auto &n : normals)
-		n.Zero();
-
-	// Face normals
-	Vector3 tn;
-	for (int t = 0; t < numTriangles; t++) {
-		triangles[t].trinormal(vertices, &tn);
-		normals[triangles[t].p1] += tn;
-		normals[triangles[t].p2] += tn;
-		normals[triangles[t].p3] += tn;
-	}
-
-	for (auto &n : normals)
-		n.Normalize();
-
-	// Smooth normals
-	if (smooth) {
-		kd_matcher matcher(vertices.data(), numVertices);
-		for (int i = 0; i < matcher.matches.size(); i++) {
-			std::pair<Vector3*, int>& a = matcher.matches[i].first;
-			std::pair<Vector3*, int>& b = matcher.matches[i].second;
-
-			Vector3& an = normals[a.second];
-			Vector3& bn = normals[b.second];
-			if (an.angle(bn) < smoothThresh * DEG2RAD) {
-				Vector3 anT = an;
-				an += bn;
-				bn += anT;
-			}
-		}
-
-		for (auto &n : normals)
-			n.Normalize();
-	}
+	CalculateNormals(vertices, triangles, normals, smooth, smoothThresh);
 }
 
 void NiTriShapeData::CalcTangentSpace() {
@@ -2094,41 +2282,7 @@ void NiTriStripsData::RecalcNormals(const bool smooth, const float smoothThresh)
 
 	std::vector<Triangle> tris = StripsToTris();
 
-	// Zero out existing normals
-	for (auto &n : normals)
-		n.Zero();
-
-	// Face normals
-	Vector3 tn;
-	for (int t = 0; t < tris.size(); t++) {
-		tris[t].trinormal(vertices, &tn);
-		normals[tris[t].p1] += tn;
-		normals[tris[t].p2] += tn;
-		normals[tris[t].p3] += tn;
-	}
-
-	for (auto &n : normals)
-		n.Normalize();
-
-	// Smooth normals
-	if (smooth) {
-		kd_matcher matcher(vertices.data(), numVertices);
-		for (int i = 0; i < matcher.matches.size(); i++) {
-			std::pair<Vector3*, int>& a = matcher.matches[i].first;
-			std::pair<Vector3*, int>& b = matcher.matches[i].second;
-
-			Vector3& an = normals[a.second];
-			Vector3& bn = normals[b.second];
-			if (an.angle(bn) < smoothThresh * DEG2RAD) {
-				Vector3 anT = an;
-				an += bn;
-				bn += anT;
-			}
-		}
-
-		for (auto &n : normals)
-			n.Normalize();
-	}
+	CalculateNormals(vertices, tris, normals, smooth, smoothThresh);
 }
 
 void NiTriStripsData::CalcTangentSpace() {
